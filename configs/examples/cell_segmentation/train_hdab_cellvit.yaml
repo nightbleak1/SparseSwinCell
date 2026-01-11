@@ -1,0 +1,98 @@
+# CellViT 训练配置文件（基于 H-DAB_PanNuke 数据集优化）
+
+# 日志与 WandB 设置
+logging:
+  mode: offline                   # 在线模式记录实验
+  project: Cell-Segmentation     # WandB 项目名称
+  notes: CellViT-256-Training-H-DAB    # 实验备注
+  log_comment: CellViT-H-DAB-Setting  # 本地日志文件夹名称
+  tags:                          # 实验标签
+    - "SwinTransformer"
+    - "H-DAB"
+    - "PanNuke"
+    - "Our-Setting"
+  wandb_dir: ./results/H-DAB_PanNuke   # WandB 数据存储目录（需提前创建）
+  log_dir: ./logs/train_hdab_cellvit  # 本地日志存储目录
+  level: Debug                   # 日志级别
+  log_images: true               # 记录图像到 WandB
+  group: CellViT-H-DAB-Setting     # WandB 分组
+
+# 随机种子（保证可复现性）
+random_seed: 19
+
+# 硬件配置
+gpu: 0                           # 使用的 GPU 编号（单卡训练）
+
+# 数据集配置
+data:
+  dataset: PanNuke               # 数据集名称（支持 PanNuke/Conic）
+  dataset_path: /hy-tmp/project/cell_segmentation/datasets/process/H-DAB_PanNuke  # H-DAB 处理后的数据集路径
+  train_folds: [0, 1, 2]         # 训练集包含 fold0、fold1、fold2
+  val_split: 0.1                 # 从训练集中抽取 10% 作为验证集
+  test_split: 0.1                # 从训练集中抽取 10% 作为测试集
+
+  num_nuclei_classes: 6          # 细胞核类别数（含背景）
+  num_tissue_classes: 19         # 组织类别数（PanNuke 特定）
+  input_shape: 256               # 输入图像尺寸
+  input_channels: 2              # 输入通道数（H-DAB 双通道）
+  magnification: 40              # 图像放大倍数
+
+# 模型配置
+model:
+  backbone: SwinTransformer      # 使用 Swin Transformer 作为骨干网络
+  input_channels: 2              # 输入通道数（H-DAB 双通道）
+  embed_dim: 96                  # Swin Transformer 嵌入维度
+  depth: 12                      # Swin Transformer 深度
+  num_heads: 3                   # Swin Transformer 注意力头数
+  window_size: 7                 # Swin Transformer 窗口大小
+  k: 0.5                         # km 注意力的 top-k 比例
+  shared_skip_connections: true  # 共享跳跃连接
+
+# 预训练策略
+pretrain:
+  use_mae: true                  # 使用 MAE 自监督学习进行预训练
+  mae_epochs: 100                 # MAE 预训练轮次
+  mask_ratio: 0.75               # MAE mask 比例
+  pretrain_lr: 1e-4              # 预训练学习率
+
+# 训练配置
+train:
+  batch_size: 16                 # 训练批次大小
+  epochs: 50                     # 微调训练轮次（从 200 减少到 50）
+  learning_rate: 1e-4            # 学习率
+  weight_decay: 1e-4             # 权重衰减
+  optimizer: adamw               # 优化器
+  scheduler: cosine_annealing    # 学习率调度器
+  warmup_epochs: 5               # 预热轮次
+  mixed_precision: true          # 使用混合精度训练
+  early_stopping:                # 早停设置
+    enabled: true
+    patience: 10
+    min_delta: 0.001
+
+# 损失函数配置（多分支联合优化）
+loss:
+  nuclei_binary_map:             # 细胞核二值分割分支
+    focaltverskyloss:
+      loss_fn: FocalTverskyLoss
+      weight: 1.0
+    dice:
+      loss_fn: dice_loss
+      weight: 1.0
+  hv_map:                        # 水平垂直距离图分支（用于实例分割）
+    mse:
+      loss_fn: mse_loss_maps
+      weight: 2.5
+    msge:
+      loss_fn: msge_loss_maps
+      weight: 8.0
+  nuclei_type_map:               # 细胞核类型分类分支
+    bce:
+      loss_fn: xentropy_loss
+      weight: 0.5
+    dice:
+      loss_fn: dice_loss
+      weight: 0.5
+
+# 推理配置
+eval_checkpoint: latest_checkpoint.pth  # 评估最新 checkpoint

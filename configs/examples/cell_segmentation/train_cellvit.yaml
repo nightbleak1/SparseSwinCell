@@ -1,0 +1,145 @@
+# CellViT 训练配置文件（基于 PanNuke 数据集优化）
+
+# 日志与 WandB 设置
+logging:
+  mode: offline                   # 在线模式记录实验
+  project: Cell-Segmentation     # WandB 项目名称
+  notes: CellViT-256-Training    # 实验备注
+  log_comment: CellViT-Our-Setting  # 本地日志文件夹名称
+  tags:                          # 实验标签
+    - "ViT256"
+    - "PanNuke"
+    - "Our-Setting"
+  wandb_dir: ./results/PanNuke   # WandB 数据存储目录（需提前创建）
+  log_dir: ./logs/train_cellvit  # 本地日志存储目录
+  level: Debug                   # 日志级别
+  log_images: true               # 记录图像到 WandB
+  group: CellViT-Our-Setting     # WandB 分组
+
+# 随机种子（保证可复现性）
+random_seed: 19
+
+# 硬件配置
+gpu: 0                           # 使用的 GPU 编号（单卡训练）
+
+# 数据集配置
+data:
+  dataset: PanNuke               # 数据集名称（支持 PanNuke/Conic）
+  dataset_path: /hy-tmp/CellViT-main/cell_segmentation/datasets/process/PanNuke  # 数据集根路径
+  train_folds: [0, 1, 2]         # 训练集包含 fold0、fold1、fold2
+  val_split: 0.1                 # 从训练集中抽取 10% 作为验证集（替代原 val_folds）
+  # val_folds: [1]               # 注释掉原验证集折叠配置（与 val_split 互斥）
+  test_split: 0.1                # 从训练集中抽取 10% 作为测试集（替代原 test_folds）
+  # test_folds: [2]              # 注释掉原测试集折叠配置（与 test_split 互斥）
+  num_nuclei_classes: 6          # 细胞核类别数（含背景）
+  num_tissue_classes: 19         # 组织类别数（PanNuke 特定）
+  input_shape: 256               # 输入图像尺寸（与 ViT256 匹配）
+
+# 模型配置
+model:
+  backbone: ViT256               # 骨干网络（ViT256/SAM-B 等）
+  pretrained_encoder: /hy-tmp/CellViT-main/models/pretrained/CellViT-256-x40.pth  # 预训练编码器路径
+  shared_skip_connections: true  # 共享跳跃连接（提升分割精度）
+  embed_dim: 384                 # ViT 嵌入维度（ViT-S 对应 384）
+  depth: 12                      # Transformer 块数量（ViT-S 对应 12）
+  num_heads: 6                   # 注意力头数（ViT-S 对应 6）
+  input_channels: 2              # 输入通道（HED 双通道图像）
+
+# 损失函数配置（多分支联合优化）
+loss:
+  nuclei_binary_map:             # 细胞核二值分割分支
+    focaltverskyloss:
+      loss_fn: FocalTverskyLoss
+      weight: 1.0
+    dice:
+      loss_fn: dice_loss
+      weight: 1.0
+  hv_map:                        # 水平垂直距离图分支（用于实例分割）
+    mse:
+      loss_fn: mse_loss_maps
+      weight: 2.5
+    msge:
+      loss_fn: msge_loss_maps
+      weight: 8.0
+  nuclei_type_map:               # 细胞核类型分类分支
+    bce:
+      loss_fn: xentropy_loss
+      weight: 0.5
+    dice:
+      loss_fn: dice_loss
+      weight: 0.2
+    mcfocaltverskyloss:
+      loss_fn: MCFocalTverskyLoss
+      weight: 0.5
+      args:
+        num_classes: 6
+  tissue_types:                  # 组织类型分类分支（辅助任务）
+    ce:
+      loss_fn: CrossEntropyLoss
+      weight: 0.1
+
+# 训练参数配置
+training:
+  batch_size: 24                 # 批大小（根据 GPU 显存调整，16G 显存推荐 16）
+  epochs: 130                    # 训练总轮数
+  unfreeze_epoch: 25             # 解冻预训练编码器的轮数（先微调后全量训练）
+  drop_rate: 0.0                 #  dropout 概率
+  attn_drop_rate: 0.1            # 注意力层 dropout 概率
+  drop_path_rate: 0.1            # 路径 dropout 概率（防止过拟合）
+  optimizer: AdamW               # 优化器
+  optimizer_hyperparameter:
+    lr: 0.0003                   # 初始学习率
+    betas: [0.85, 0.95]          # AdamW 动量参数
+    weight_decay: 0.0001         # 权重衰减（正则化）
+  early_stopping_patience: 130   # 早停耐心值（不早停，完整训练）
+  scheduler:
+    scheduler_type: exponential  # 学习率调度器
+    hyperparameters:
+      gamma: 0.85                # 指数衰减因子
+  sampling_strategy: cell+tissue # 采样策略（平衡细胞和组织类别）
+  sampling_gamma: 0.85           # 采样平衡因子
+  mixed_precision: true          # 混合精度训练（加速训练）
+  eval_every: 10                 # 每 10 轮验证一次
+
+# 数据增强配置（提升泛化能力）
+transformations:
+  randomrotate90:
+    p: 0.5                       # 50% 概率随机旋转90度（保持不变）
+  horizontalflip:
+    p: 0.5                       # 50% 概率水平翻转（保持不变）
+  verticalflip:
+    p: 0.5                       # 50% 概率垂直翻转（保持不变）
+  downscale:
+    p: 0.15                      # 15% 概率下采样（保持不变）
+    scale: 0.5                   # 下采样至原尺寸的50%（保持不变）
+  blur:
+    p: 0.2                       # 20% 概率模糊（保持不变）
+    blur_limit: 10               # 模糊核大小上限（保持不变）
+  gaussnoise:
+    p: 0.25                      # 25% 概率加高斯噪声（保持不变）
+    var_limit: [10, 50]          # 噪声方差范围（优化：从固定值改为范围，增强多样性）
+  colorjitter:
+    p: 0.2                       # 20% 概率颜色抖动（保持不变）
+    scale_setting: 0.25          # 亮度/对比度缩放因子（保持不变）
+    scale_color: 0.1             # 色调/饱和度缩放因子（保持不变）
+  superpixels:
+    p: 0.1                       # 10% 概率超像素增强（保持不变）
+    num_segments: 150            # 补充：超像素数量（常用范围100-200，避免参数缺失）
+  zoomblur:
+    p: 0.1                       # 10% 概率缩放模糊（保持不变）
+    max_factor: [1.0, 1.5]       # 补充：缩放因子范围（1.0-1.5倍，控制模糊强度）
+  randomsizedcrop:
+    p: 0.1                       # 10% 概率随机裁剪（保持不变）
+    min_max_height: [192, 256]   # 补充：裁剪前的尺寸范围（适配256输入）
+    size: 256                    # 补充：裁剪后尺寸（与input_shape一致，解决KeyError）
+    w2h_ratio: 1.0               # 补充：宽高比保持1:1（正方形图像专用）
+  elastictransform:
+    p: 0.2                       # 20% 概率弹性形变（保持不变）
+    alpha: 100                   # 补充：弹性形变强度（常用100-200）
+    sigma: 10                    # 补充：高斯核标准差（控制平滑度，常用5-15）
+  normalize:
+    mean: [0.5, 0.5]             # 归一化均值（HED双通道）
+    std: [0.5, 0.5]              # 归一化标准差（HED双通道）
+
+# 评估 checkpoint
+eval_checkpoint: latest_checkpoint.pth  # 评估最新 checkpoint
