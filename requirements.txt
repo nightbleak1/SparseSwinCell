@@ -1,0 +1,38 @@
+# Core dependencies
+einops==0.8.1
+numpy==2.2.6
+scipy==1.16.3
+pandas==2.3.3
+natsort==8.4.0
+
+# PyTorch ecosystem
+torch==2.9.1
+torchvision==0.24.1
+torchaudio==2.9.1
+pytorch-triton==3.3.0+git96316ce5
+torchinfo==1.8.0
+torchmetrics==1.8.2
+
+# Computer vision
+opencv-contrib-python==4.11.0.86
+opencv-python-headless==4.12.0.88
+pillow==11.0.0
+scikit-image==0.26.0
+
+# Machine learning
+scikit-learn==1.8.0
+
+# Visualization
+matplotlib==3.10.8
+
+# Logging and experiment tracking
+wandb==0.23.1
+python-json-logger==3.3.0
+
+# Utilities
+tqdm==4.67.1
+PyYAML==6.0.2
+schema==0.7.8
+
+# Other
+typing_extensions==4.15.0
