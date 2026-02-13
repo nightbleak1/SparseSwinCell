@@ -1,0 +1,42 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+.env
+.venv
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# Logs and Checkpoints
+logs/
+checkpoints/
+*.log
+*.pth
+*.pt
+experiment_logs/
+
+# Datasets
+cell_segmentation/datasets/original/
+cell_segmentation/datasets/process/
+*.tif
+*.tiff
+*.svs
+*.png
+*.jpg
+*.jpeg
+*.npy
+*.npz
+
+# VS Code
+.vscode/
+
+# Mac OS
+.DS_Store
+
+# Pretrained models
+models/pretrained/

@@ -39,7 +39,7 @@ from skimage.color import rgba2rgb
 from sklearn.metrics import accuracy_score
 from tabulate import tabulate
 from torch.utils.data import DataLoader
-from torchmetrics.functional import dice
+from torchmetrics.functional import f1_score as dice
 from torchmetrics.functional.classification import binary_jaccard_index
 from torchvision import transforms
 
@@ -54,16 +54,8 @@ from cell_segmentation.utils.metrics import (
 )
 from cell_segmentation.utils.post_proc_cellvit import calculate_instances
 from cell_segmentation.utils.tools import cropping_center, pair_coordinates
-from models.segmentation.cell_segmentation.cellvit import (
-    CellViT,
-    CellViT256,
-    CellViTSAM,
-)
-from models.segmentation.cell_segmentation.cellvit_shared import (
-    CellViT256Shared,
-    CellViTSAMShared,
-    CellViTShared,
-)
+from models.segmentation.cell_segmentation.sparse_cellvit import SparseCellViT
+
 from utils.logger import Logger
 
 
@@ -150,85 +142,33 @@ class InferenceCellViT:
     def get_model(
         self, model_type: str
     ) -> Union[
-        CellViT,
-        CellViTShared,
-        CellViT256,
-        CellViT256Shared,
-        CellViTSAM,
-        CellViTSAMShared,
+        SparseCellViT
     ]:
         """Return the trained model for inference
 
         Args:
-            model_type (str): Name of the model. Must either be one of:
-                CellViT, CellViTShared, CellViT256, CellViT256Shared, CellViTSAM, CellViTSAMShared
+            model_type (str): Name of the model.
 
         Returns:
-            Union[CellViT, CellViTShared, CellViT256, CellViT256Shared, CellViTSAM, CellViTSAMShared]: Model
+            Union[SparseCellViT]: Model
         """
-        implemented_models = [
-            "CellViT",
-            "CellViTShared",
-            "CellViT256",
-            "CellViT256Shared",
-            "CellViTSAM",
-            "CellViTSAMShared",
-        ]
-        if model_type not in implemented_models:
-            raise NotImplementedError(
-                f"Unknown model type. Please select one of {implemented_models}"
-            )
-        if model_type in ["CellViT", "CellViTShared"]:
-            if model_type == "CellViT":
-                model_class = CellViT
-            elif model_type == "CellViTShared":
-                model_class = CellViTShared
-            model = model_class(
-                num_nuclei_classes=self.run_conf["data"]["num_nuclei_classes"],
-                num_tissue_classes=self.run_conf["data"]["num_tissue_classes"],
-                embed_dim=self.run_conf["model"]["embed_dim"],
-                input_channels=self.run_conf["model"].get("input_channels", 3),
-                depth=self.run_conf["model"]["depth"],
-                num_heads=self.run_conf["model"]["num_heads"],
-                extract_layers=self.run_conf["model"]["extract_layers"],
-                regression_loss=self.run_conf["model"].get("regression_loss", False),
-            )
-
-        elif model_type in ["CellViT256", "CellViT256Shared"]:
-            if model_type == "CellViT256":
-                model_class = CellViT256
-            elif model_type == "CellViT256Shared":
-                model_class = CellViT256Shared
-            model = model_class(
-                model256_path=None,
-                num_nuclei_classes=self.run_conf["data"]["num_nuclei_classes"],
-                num_tissue_classes=self.run_conf["data"]["num_tissue_classes"],
-                regression_loss=self.run_conf["model"].get("regression_loss", False),
-            )
-        elif model_type in ["CellViTSAM", "CellViTSAMShared"]:
-            if model_type == "CellViTSAM":
-                model_class = CellViTSAM
-            elif model_type == "CellViTSAMShared":
-                model_class = CellViTSAMShared
-            model = model_class(
-                model_path=None,
-                num_nuclei_classes=self.run_conf["data"]["num_nuclei_classes"],
-                num_tissue_classes=self.run_conf["data"]["num_tissue_classes"],
-                vit_structure=self.run_conf["model"]["backbone"],
-                regression_loss=self.run_conf["model"].get("regression_loss", False),
-            )
+        model = SparseCellViT(
+            num_nuclei_classes=self.run_conf["data"]["num_nuclei_classes"],
+            num_tissue_classes=self.run_conf["data"]["num_tissue_classes"],
+            embed_dim=self.run_conf["model"]["embed_dim"],
+            input_channels=self.run_conf["model"].get("input_channels", 3),
+            depth=self.run_conf["model"]["depth"],
+            num_heads=self.run_conf["model"]["num_heads"],
+            extract_layers=self.run_conf["model"]["extract_layers"],
+            regression_loss=self.run_conf["model"].get("regression_loss", False),
+        )
         return model
 
     def setup_patch_inference(
         self, test_folds: List[int] = None
     ) -> tuple[
         Union[
-            CellViT,
-            CellViTShared,
-            CellViT256,
-            CellViT256Shared,
-            CellViTSAM,
-            CellViTSAMShared,
+            SparseCellViT
         ],
         DataLoader,
         dict,
@@ -239,8 +179,8 @@ class InferenceCellViT:
             test_folds (List[int], optional): Test fold to use. Otherwise defined folds from config.yaml (in run_dir) are loaded. Defaults to None.
 
         Returns:
-            tuple[Union[CellViT, CellViTShared, CellViT256, CellViT256Shared, CellViTSAM, CellViTSAMShared], DataLoader, dict]:
-                Union[CellViT, CellViTShared, CellViT256, CellViT256Shared, CellViTSAM, CellViTSAMShared]: Best model loaded form checkpoint
+            tuple[Union[SparseCellViT], DataLoader, dict]:
+                Union[SparseCellViT]: Best model loaded form checkpoint
                 DataLoader: Inference DataLoader
                 dict: Dataset configuration. Keys are:
                     * "tissue_types": describing the present tissue types with corresponding integer
@@ -249,9 +189,9 @@ class InferenceCellViT:
         """
         # get model for inference
         checkpoint = torch.load(
-            self.run_dir / "checkpoints" / self.checkpoint_name, map_location="cpu"
+            self.run_dir / "checkpoints" / self.checkpoint_name, map_location="cpu", weights_only=False
         )
-        model = self.get_model(model_type=checkpoint["arch"])
+        model = self.get_model(model_type=checkpoint.get("arch", "SparseCellViT"))
         self.logger.info(
             f"Loading best model from {str(self.run_dir / 'checkpoints' / self.checkpoint_name)}"
         )
@@ -307,21 +247,17 @@ class InferenceCellViT:
     def run_patch_inference(
         self,
         model: Union[
-            CellViT,
-            CellViTShared,
-            CellViT256,
-            CellViT256Shared,
-            CellViTSAM,
-            CellViTSAMShared,
+            SparseCellViT
         ],
         inference_dataloader: DataLoader,
         dataset_config: dict,
         generate_plots: bool = False,
+        limit: int = None,
     ) -> None:
         """Run Patch inference with given setup
 
         Args:
-            model (Union[CellViT, CellViTShared, CellViT256, CellViT256Shared, CellViTSAM, CellViTSAMShared]): Model to use for inference
+            model (Union[SparseCellViT]): Model to use for inference
             inference_dataloader (DataLoader): Inference Dataloader. Must return a batch with the following structure:
                 * Images (torch.Tensor)
                 * Masks (dict)
@@ -331,6 +267,7 @@ class InferenceCellViT:
                     * "tissue_types": describing the present tissue types with corresponding integer
                     * "nuclei_types": describing the present nuclei types with corresponding integer
             generate_plots (bool, optional): If inference plots should be generated. Defaults to False.
+            limit (int, optional): Limit the number of batches to process. Defaults to None.
         """
         # put model in eval mode
         model.to(device=self.device)
@@ -364,12 +301,18 @@ class InferenceCellViT:
         true_idx_offset = 0
         pred_idx_offset = 0
 
+        total_batches = len(inference_dataloader)
+        if limit is not None:
+            total_batches = min(total_batches, limit)
+
         inference_loop = tqdm.tqdm(
-            enumerate(inference_dataloader), total=len(inference_dataloader)
+            enumerate(inference_dataloader), total=total_batches
         )
 
         with torch.no_grad():
             for batch_idx, batch in inference_loop:
+                if limit is not None and batch_idx >= limit:
+                    break
                 batch_metrics = self.inference_step(
                     model, batch, generate_plots=generate_plots
                 )
@@ -425,7 +368,19 @@ class InferenceCellViT:
                 unpaired_pred_all_global.append(batch_metrics["unpaired_pred_all"])
 
         # assemble batches to datasets (global)
-        tissue_types_inf = [t.lower() for t in tissue_types_inf]
+        # tissue_types_inf = [t.lower() for t in tissue_types_inf]
+        
+        # Handle tissue types conversion (int/tensor to string)
+        inv_tissue_types = {v: k for k, v in dataset_config["tissue_types"].items()}
+        tissue_types_inf_clean = []
+        for t in tissue_types_inf:
+            if isinstance(t, torch.Tensor):
+                t = t.item()
+            if isinstance(t, (int, np.integer)):
+                tissue_types_inf_clean.append(inv_tissue_types.get(t, str(t)).lower())
+            else:
+                tissue_types_inf_clean.append(str(t).lower())
+        tissue_types_inf = tissue_types_inf_clean
 
         paired_all = np.concatenate(paired_all_global, axis=0)
         unpaired_true_all = np.concatenate(unpaired_true_all_global, axis=0)
@@ -599,12 +554,7 @@ class InferenceCellViT:
     def inference_step(
         self,
         model: Union[
-            CellViT,
-            CellViTShared,
-            CellViT256,
-            CellViT256Shared,
-            CellViTSAM,
-            CellViTSAMShared,
+            SparseCellViT
         ],
         batch: tuple,
         generate_plots: bool = False,
@@ -612,7 +562,7 @@ class InferenceCellViT:
         """Inference step for a patch-wise batch
 
         Args:
-            model (CellViT): Model to use for inference
+            model (SparseCellViT): Model to use for inference
             batch (tuple): Batch with the following structure:
                 * Images (torch.Tensor)
                 * Masks (dict)
@@ -641,8 +591,8 @@ class InferenceCellViT:
         if generate_plots:
             self.plot_results(
                 imgs=imgs,
-                predictions=predictions,
-                ground_truth=gt,
+                predictions=predictions.get_dict(),
+                ground_truth=gt.get_dict(),
                 img_names=image_names,
                 num_nuclei_classes=self.num_classes,
                 outdir=Path(self.run_dir / "inference_predictions"),
@@ -652,7 +602,7 @@ class InferenceCellViT:
         return batch_metrics
 
     def unpack_predictions(
-        self, predictions: dict, model: CellViT
+        self, predictions: dict, model: SparseCellViT
     ) -> DataclassHVStorage:
         """Unpack the given predictions. Main focus lays on reshaping and postprocessing predictions, e.g. separating instances
 
@@ -662,7 +612,7 @@ class InferenceCellViT:
                 * nuclei_binary_map: Logit output for binary nuclei prediction branch. Shape: (batch_size, H, W, 2)
                 * hv_map: Logit output for hv-prediction. Shape: (batch_size, H, W, 2)
                 * nuclei_type_map: Logit output for nuclei instance-prediction. Shape: (batch_size, num_nuclei_classes, H, W)
-            model (CellViT): Current model
+            model (SparseCellViT): Current model
 
         Returns:
             DataclassHVStorage: Processed network output
@@ -700,7 +650,7 @@ class InferenceCellViT:
         return predictions
 
     def unpack_masks(
-        self, masks: dict, tissue_types: list, model: CellViT
+        self, masks: dict, tissue_types: list, model: SparseCellViT
     ) -> DataclassHVStorage:
         # get ground truth values, perform one hot encoding for segmentation maps
         gt_nuclei_binary_map_onehot = (
@@ -716,6 +666,15 @@ class InferenceCellViT:
         )  # background + nuclei types
 
         # assemble ground truth dictionary
+        # handle tissue types
+        if isinstance(tissue_types[0], (str, np.str_)):
+            tissue_types_tensor = torch.Tensor(
+                [self.dataset_config["tissue_types"][t] for t in tissue_types]
+            ).type(torch.LongTensor).to(self.device)
+        else:
+            # Assume already integers
+            tissue_types_tensor = torch.as_tensor(tissue_types).type(torch.LongTensor).to(self.device)
+
         gt = {
             "nuclei_type_map": gt_nuclei_type_maps_onehot.permute(0, 3, 1, 2).to(
                 self.device
@@ -734,11 +693,7 @@ class InferenceCellViT:
             .to(
                 self.device
             ),  # shape: (batch_size, num_nuclei_classes, H, W) -> instance has one integer, for each nuclei class
-            "tissue_types": torch.Tensor(
-                [self.dataset_config["tissue_types"][t] for t in tissue_types]
-            )
-            .type(torch.LongTensor)
-            .to(self.device),  # shape: batch_size
+            "tissue_types": tissue_types_tensor,  # shape: batch_size
         }
         gt["instance_types"] = calculate_instances(
             gt["nuclei_type_map"], gt["instance_map"]
@@ -822,7 +777,7 @@ class InferenceCellViT:
             pred_binary_map = torch.argmax(predictions["nuclei_binary_map"][i], dim=0)
             target_binary_map = gt["nuclei_binary_map"][i]
             cell_dice = (
-                dice(preds=pred_binary_map, target=target_binary_map, ignore_index=0)
+                dice(preds=pred_binary_map, target=target_binary_map, ignore_index=0, task="binary")
                 .detach()
                 .cpu()
             )
@@ -1002,8 +957,8 @@ class InferenceCellViT:
         outdir = Path(outdir)
         outdir.mkdir(exist_ok=True, parents=True)
 
-        h = ground_truth["hv_map"].shape[1]
-        w = ground_truth["hv_map"].shape[2]
+        h = ground_truth["hv_map"].shape[2]
+        w = ground_truth["hv_map"].shape[3]
 
         # convert to rgb and crop to selection
         sample_images = (
@@ -1011,25 +966,31 @@ class InferenceCellViT:
         )  # convert to rgb
         sample_images = cropping_center(sample_images, (h, w), True)
 
+        # Permute predictions to (B, H, W, C) for plotting
         pred_sample_binary_map = (
-            predictions["nuclei_binary_map"][:, :, :, 1].detach().cpu().numpy()
+            predictions["nuclei_binary_map"].permute(0, 2, 3, 1).detach().cpu().numpy()
         )
-        pred_sample_hv_map = predictions["hv_map"].detach().cpu().numpy()
+        pred_sample_hv_map = predictions["hv_map"].permute(0, 2, 3, 1).detach().cpu().numpy()
         pred_sample_instance_maps = predictions["instance_map"].detach().cpu().numpy()
         pred_sample_type_maps = (
-            torch.argmax(predictions["nuclei_type_map"], dim=-1).detach().cpu().numpy()
+            torch.argmax(predictions["nuclei_type_map"].permute(0, 2, 3, 1), dim=-1).detach().cpu().numpy()
         )
 
         # get ground truth labels
-        # gt_sample_binary_map = (
-        #     torch.argmax(ground_truth["nuclei_binary_map"], dim=-1).detach().cpu()
-        # )
-        gt_sample_binary_map = ground_truth["nuclei_binary_map"].detach().cpu().numpy()
-        gt_sample_hv_map = ground_truth["hv_map"].detach().cpu().numpy()
+        # Permute GT to (B, H, W, C)
+        gt_sample_binary_map = ground_truth["nuclei_binary_map"].permute(0, 2, 3, 1).detach().cpu().numpy()
+        gt_sample_hv_map = ground_truth["hv_map"].permute(0, 2, 3, 1).detach().cpu().numpy()
         gt_sample_instance_map = ground_truth["instance_map"].detach().cpu().numpy()
         gt_sample_type_map = (
-            torch.argmax(ground_truth["nuclei_type_map"], dim=-1).detach().cpu().numpy()
+            torch.argmax(ground_truth["nuclei_type_map"].permute(0, 2, 3, 1), dim=-1).detach().cpu().numpy()
         )
+        
+        # Take argmax of binary maps for plotting (if they are one-hot/softmax)
+        # pred_sample_binary_map shape is (B, H, W, 2) -> take channel 1 or argmax
+        pred_sample_binary_map = pred_sample_binary_map[..., 1] # Probability of foreground
+        
+        # gt_sample_binary_map shape is (B, H, W, 2) -> take channel 1 or argmax
+        gt_sample_binary_map = np.argmax(gt_sample_binary_map, axis=-1)
 
         # create colormaps
         hv_cmap = plt.get_cmap("jet")
@@ -1045,10 +1006,19 @@ class InferenceCellViT:
         else:
             mean = (0.5, 0.5, 0.5)
             std = (0.5, 0.5, 0.5)
-        inv_normalize = transforms.Normalize(
-            mean=[-0.5 / mean[0], -0.5 / mean[1], -0.5 / mean[2]],
-            std=[1 / std[0], 1 / std[1], 1 / std[2]],
-        )
+        
+        # Correct inversion of normalization: x_orig = x_norm * std + mean
+        # Normalize does (x - m') / s'
+        # We want (x_norm - (-mean/std)) / (1/std) = x_norm * std + mean
+        try:
+            inv_normalize = transforms.Normalize(
+                mean=[-m / s for m, s in zip(mean, std)],
+                std=[1 / s for s in std],
+            )
+        except ZeroDivisionError:
+             # Fallback if std is 0 (should not happen) or mean logic fails
+             inv_normalize = transforms.Normalize(mean=[0, 0, 0], std=[1, 1, 1])
+        
         inv_samples = inv_normalize(torch.tensor(sample_images).permute(0, 3, 1, 2))
         sample_images = inv_samples.permute(0, 2, 3, 1).detach().cpu().numpy()
 
@@ -1239,6 +1209,12 @@ class InferenceCellViTParser:
             action="store_true",
             help="Generate inference plots in run_dir",
         )
+        parser.add_argument(
+            "--limit",
+            type=int,
+            help="Limit the number of batches to process (for debugging)",
+            default=None,
+        )
 
         self.parser = parser
 
@@ -1260,5 +1236,5 @@ if __name__ == "__main__":
     model, dataloader, conf = inf.setup_patch_inference()
 
     inf.run_patch_inference(
-        model, dataloader, conf, generate_plots=configuration["plots"]
+        model, dataloader, conf, generate_plots=configuration["plots"], limit=configuration["limit"]
     )

@@ -39,6 +39,10 @@ class LocalSparseAttention(nn.Module):
             if rel_pos_zero_init:
                 nn.init.zeros_(self.rel_pos_h)
                 nn.init.zeros_(self.rel_pos_w)
+            else:
+                # 使用 Xavier 初始化，提高模型收敛速度
+                nn.init.xavier_uniform_(self.rel_pos_h)
+                nn.init.xavier_uniform_(self.rel_pos_w)
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         B, N, C = x.shape
@@ -87,7 +91,7 @@ class LocalSparseAttention(nn.Module):
 
 class ContentBasedSparseAttention(nn.Module):
     """基于内容的稀疏注意力机制
-    只对信息熵高的关键区域计算全注意力
+    只对信息熵高的关键区域计算全注意力，支持动态k值调整
     """
     def __init__(
         self,
@@ -97,10 +101,16 @@ class ContentBasedSparseAttention(nn.Module):
         qkv_bias: bool = True,
         attn_drop: float = 0.0,
         proj_drop: float = 0.0,
+        dynamic_k: bool = False,
+        min_k_ratio: float = 0.1,
+        max_k_ratio: float = 0.7,
     ):
         super().__init__()
         self.num_heads = num_heads
         self.top_k_ratio = top_k_ratio
+        self.dynamic_k = dynamic_k
+        self.min_k_ratio = min_k_ratio
+        self.max_k_ratio = max_k_ratio
         head_dim = dim // num_heads
         self.scale = head_dim ** -0.5
 
@@ -109,27 +119,48 @@ class ContentBasedSparseAttention(nn.Module):
         self.proj = nn.Linear(dim, dim)
         self.proj_drop = nn.Dropout(proj_drop)
         
-        # 显著性检测模块
+        # 改进的显著性检测模块：增加隐藏层、层归一化和跳跃连接
         self.saliency_detector = nn.Sequential(
             nn.Linear(dim, dim // 2),
+            nn.LayerNorm(dim // 2),
             nn.GELU(),
-            nn.Linear(dim // 2, 1),
+            nn.Linear(dim // 2, dim // 4),
+            nn.LayerNorm(dim // 4),
+            nn.GELU(),
+            nn.Linear(dim // 4, 1),
         )
+        # 跳跃连接
+        self.saliency_shortcut = nn.Linear(dim, 1)
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         B, N, C = x.shape
         
-        # 检测关键特征向量
+        # 检测关键特征向量（使用改进的显著性检测模块和跳跃连接）
         saliency_scores = self.saliency_detector(x).squeeze(-1)  # [B, N]
-        top_k = max(1, int(N * self.top_k_ratio))
+        shortcut_scores = self.saliency_shortcut(x).squeeze(-1)  # [B, N]
+        saliency_scores = saliency_scores + shortcut_scores  # 添加跳跃连接
+        
+        # 动态k值调整
+        if self.dynamic_k:
+            # 计算特征熵来动态调整k值
+            saliency_probs = saliency_scores.softmax(dim=-1)
+            entropy = -torch.sum(saliency_probs * torch.log(saliency_probs + 1e-8), dim=-1)
+            entropy = entropy / torch.log(torch.tensor(N, dtype=torch.float32))
+            current_k_ratio = self.min_k_ratio + (self.max_k_ratio - self.min_k_ratio) * entropy
+            current_k_ratio = torch.clamp(current_k_ratio, self.min_k_ratio, self.max_k_ratio)
+            top_k = (current_k_ratio * N).long().clamp(min=1)
+        else:
+            top_k = max(1, int(N * self.top_k_ratio))
+            current_k_ratio = torch.tensor([self.top_k_ratio] * B, device=x.device)
         
         # 为每个样本选择top-k个关键特征
-        _, indices = torch.topk(saliency_scores, top_k, dim=1)  # [B, K]
+        top_k = top_k.clamp(max=N)
+        _, indices = torch.topk(saliency_scores, top_k.max().item(), dim=1)  # [B, K]
         
         # 构建掩码
         mask = torch.zeros_like(saliency_scores, dtype=torch.bool)
         for b in range(B):
-            mask[b, indices[b]] = True
+            mask[b, indices[b, :top_k[b]]] = True
         
         # 只对关键特征计算全注意力
         qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads)
@@ -168,11 +199,22 @@ class MixedSparseAttention(nn.Module):
         proj_drop: float = 0.0,
         use_rel_pos: bool = False,
         input_size: Optional[Tuple[int, int]] = None,
+        dynamic_k: bool = False,
+        min_k_ratio: float = 0.1,
+        max_k_ratio: float = 0.7,
+        local_attn_weight: float = 0.7,  # 局部注意力融合权重
+        content_attn_weight: float = 0.3,  # 内容注意力融合权重
     ):
         super().__init__()
         self.num_heads = num_heads
-        self.num_local_heads = int(num_heads * local_head_ratio)
-        self.num_content_heads = num_heads - self.num_local_heads
+        # 使用向上取整确保局部注意力头数量正确，并限制在合理范围
+        self.num_local_heads = max(1, min(num_heads - 1, int(math.ceil(num_heads * local_head_ratio))))
+        self.num_content_heads = max(1, num_heads - self.num_local_heads)
+        
+        # 注意力头剪枝机制：可学习的注意力头权重
+        self.local_head_weights = nn.Parameter(torch.ones(self.num_local_heads))
+        self.content_head_weights = nn.Parameter(torch.ones(self.num_content_heads))
+        self.head_softmax = nn.Softmax(dim=0)
         
         head_dim = dim // num_heads
         self.scale = head_dim ** -0.5
@@ -190,12 +232,27 @@ class MixedSparseAttention(nn.Module):
         self.window_size = window_size
         self.top_k_ratio = top_k_ratio
         
-        # 显著性检测模块
+        # 改进的显著性检测模块：增加隐藏层、层归一化和跳跃连接
         self.saliency_detector = nn.Sequential(
             nn.Linear(dim, dim // 2),
+            nn.LayerNorm(dim // 2),
             nn.GELU(),
-            nn.Linear(dim // 2, 1),
+            nn.Linear(dim // 2, dim // 4),
+            nn.LayerNorm(dim // 4),
+            nn.GELU(),
+            nn.Linear(dim // 4, 1),
         )
+        # 跳跃连接
+        self.saliency_shortcut = nn.Linear(dim, 1)
+        
+        # 动态k值参数
+        self.dynamic_k = dynamic_k
+        self.min_k_ratio = min_k_ratio
+        self.max_k_ratio = max_k_ratio
+        
+        # 可学习的注意力融合权重
+        self.fusion_weight = nn.Parameter(torch.tensor([local_attn_weight, content_attn_weight], dtype=torch.float32))
+        self.softmax = nn.Softmax(dim=0)
         
         # 相对位置编码
         self.use_rel_pos = use_rel_pos
@@ -203,11 +260,50 @@ class MixedSparseAttention(nn.Module):
             assert input_size is not None, "使用相对位置编码时必须提供输入尺寸"
             self.rel_pos_h = nn.Parameter(torch.zeros(2 * window_size - 1, head_dim))
             self.rel_pos_w = nn.Parameter(torch.zeros(2 * window_size - 1, head_dim))
+            # 使用 Xavier 初始化，提高模型收敛速度
+            nn.init.xavier_uniform_(self.rel_pos_h)
+            nn.init.xavier_uniform_(self.rel_pos_w)
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         B, N, C = x.shape
-        H = W = int(math.sqrt(N))
+        
+        # 检查是否包含CLS token
+        has_cls_token = False
+        cls_token = None
+        if N > 1:
+            # 尝试计算H和W，检查是否为整数
+            H = int(math.sqrt(N))
+            if H * H != N:
+                # 包含CLS token，分离出来
+                has_cls_token = True
+                cls_token = x[:, 0:1, :]
+                patch_tokens = x[:, 1:, :]
+                B, N_patch, C = patch_tokens.shape
+                H = W = int(math.sqrt(N_patch))
+                x = patch_tokens
+                N = N_patch  # 更新N为补丁标记的数量
+            else:
+                # 不包含CLS token
+                W = H
+        else:
+            # 只有CLS token，直接返回
+            return x, None
+        
         head_dim = C // self.num_heads
+        
+        # 保存原始输入尺寸，用于后续还原
+        original_H, original_W = H, W
+        
+        # 处理非窗口大小倍数的情况：动态padding
+        pad_H = (self.window_size - H % self.window_size) % self.window_size
+        pad_W = (self.window_size - W % self.window_size) % self.window_size
+        
+        if pad_H > 0 or pad_W > 0:
+            # 对输入进行padding以适配窗口大小
+            x = x.view(B, H, W, C)
+            x = F.pad(x, (0, 0, 0, pad_W, 0, pad_H), mode='reflect')
+            x = x.view(B, (H + pad_H) * (W + pad_W), C)
+            H, W = H + pad_H, W + pad_W
         
         # 1. 局部稀疏注意力计算
         # 将输入重塑为空间维度，便于窗口划分
@@ -238,28 +334,62 @@ class MixedSparseAttention(nn.Module):
         local_attn = local_attn.softmax(dim=-1)
         local_attn = self.attn_drop(local_attn)
         
-        local_x = (local_attn @ local_v).transpose(1, 2).reshape(B_w, H_w * W_w, self.num_local_heads * head_dim)
+        local_x = (local_attn @ local_v).transpose(1, 2)  # [B_w, H_w*W_w, num_local_heads, head_dim]
+        
+        # 应用注意力头权重
+        local_head_weights = self.head_softmax(self.local_head_weights)
+        local_head_weights = local_head_weights.view(1, 1, self.num_local_heads, 1)
+        local_x = (local_x * local_head_weights).reshape(B_w, H_w * W_w, self.num_local_heads * head_dim)
         
         # 恢复窗口
         local_x = local_x.reshape(B_w, H_w, W_w, self.num_local_heads * head_dim)
         local_x = window_unpartition(local_x, self.window_size, pad_hw, (H, W))
         
         # 重塑回原始形状
-        local_x = local_x.reshape(B, N, self.num_local_heads * head_dim)
+        local_x = local_x.reshape(B, H * W, self.num_local_heads * head_dim)
         local_x = self.local_proj(local_x)
         
+        # 还原到原始尺寸（移除padding）
+        if pad_H > 0 or pad_W > 0:
+            local_x = local_x.view(B, H, W, self.num_local_heads * head_dim)
+            local_x = local_x[:, :original_H, :original_W, :].contiguous()
+            local_x = local_x.view(B, original_H * original_W, self.num_local_heads * head_dim)
+        
         # 2. 基于内容的稀疏注意力计算
-        # 检测关键特征向量
+        # 检测关键特征向量（使用改进的显著性检测模块和跳跃连接）
         saliency_scores = self.saliency_detector(x).squeeze(-1)  # [B, N]
-        top_k = max(1, int(N * self.top_k_ratio))
+        shortcut_scores = self.saliency_shortcut(x).squeeze(-1)  # [B, N]
+        saliency_scores = saliency_scores + shortcut_scores  # 添加跳跃连接
+        
+        # 动态k值调整
+        if self.dynamic_k:
+            # 训练时使用动态k值，推理时使用固定k值以确保输出稳定
+            if self.training:
+                # 计算特征熵来动态调整k值
+                saliency_probs = F.softmax(saliency_scores, dim=-1)
+                entropy = -torch.sum(saliency_probs * torch.log(saliency_probs + 1e-8), dim=-1)
+                entropy = entropy / torch.log(torch.tensor(N, dtype=saliency_scores.dtype, device=saliency_scores.device))
+                current_k_ratio = self.min_k_ratio + (self.max_k_ratio - self.min_k_ratio) * entropy
+                current_k_ratio = torch.clamp(current_k_ratio, self.min_k_ratio, self.max_k_ratio)
+                top_k = (current_k_ratio * N).long().clamp(min=1)
+            else:
+                # 推理时使用固定k值，确保输出稳定可复现
+                top_k = torch.tensor([max(1, int(N * self.top_k_ratio))], device=saliency_scores.device).expand(B)
+        else:
+            # 使用固定k值
+            top_k = torch.tensor([max(1, int(N * self.top_k_ratio))], device=saliency_scores.device).expand(B)
+        
+        # 确保top_k不超过N
+        top_k = torch.clamp(top_k, max=N)
         
         # 为每个样本选择top-k个关键特征
-        _, indices = torch.topk(saliency_scores, top_k, dim=1)  # [B, K]
+        _, indices = torch.topk(saliency_scores, top_k.max().item(), dim=1)  # [B, K]
         
-        # 构建掩码
-        mask = torch.zeros_like(saliency_scores, dtype=torch.bool)
+        # 构建掩码 - 确保与输入设备对齐
+        device = saliency_scores.device
+        mask = torch.zeros(B, N, dtype=torch.bool, device=device)
         for b in range(B):
-            mask[b, indices[b]] = True
+            mask[b, indices[b, :top_k[b]]] = True
         
         # QKV计算（仅内容注意力头）
         content_qkv = self.content_qkv(x).reshape(B, N, 3, self.num_content_heads, head_dim)
@@ -269,22 +399,39 @@ class MixedSparseAttention(nn.Module):
         # 计算内容注意力
         content_attn = (content_q @ content_k.transpose(-2, -1)) * self.scale
         
-        # 对非关键区域应用稀疏掩码
+        # 对非关键区域应用稀疏掩码 - 设备对齐
         mask_reshaped = mask.unsqueeze(1).unsqueeze(2).repeat(1, self.num_content_heads, N, 1)
         content_attn = content_attn.masked_fill(~mask_reshaped, -float('inf'))
         
         content_attn = content_attn.softmax(dim=-1)
         content_attn = self.attn_drop(content_attn)
         
-        content_x = (content_attn @ content_v).transpose(1, 2).reshape(B, N, self.num_content_heads * head_dim)
+        content_x = (content_attn @ content_v).transpose(1, 2)  # [B, N, num_content_heads, head_dim]
+        
+        # 应用注意力头权重
+        content_head_weights = self.head_softmax(self.content_head_weights)
+        content_head_weights = content_head_weights.view(1, 1, self.num_content_heads, 1)
+        content_x = (content_x * content_head_weights).reshape(B, N, self.num_content_heads * head_dim)
         content_x = self.content_proj(content_x)
         
-        # 3. 融合两种注意力的输出
-        x = local_x + content_x
+        # 还原到原始尺寸（移除padding）
+        if pad_H > 0 or pad_W > 0:
+            content_x = content_x.view(B, H, W, self.num_content_heads * head_dim)
+            content_x = content_x[:, :original_H, :original_W, :].contiguous()
+            content_x = content_x.view(B, original_H * original_W, self.num_content_heads * head_dim)
+        
+        # 3. 融合两种注意力的输出（使用可学习的加权融合）
+        weights = self.softmax(self.fusion_weight)
+        x = weights[0] * local_x + weights[1] * content_x
         x = self.proj_drop(x)
         
+        # 如果输入包含CLS token，将其重新添加回去
+        if has_cls_token and cls_token is not None:
+            x = torch.cat([cls_token, x], dim=1)
+        
         # 融合注意力图（用于可视化）
-        attn = torch.cat([local_attn.mean(1), content_attn.mean(1)], dim=1)
+        # 只返回局部注意力图，避免维度不匹配问题
+        attn = local_attn.mean(1)
         
         return x, attn
 
@@ -307,6 +454,9 @@ class SparseVisionTransformerBlock(nn.Module):
         local_head_ratio: float = 0.6,
         use_rel_pos: bool = False,
         input_size: Optional[Tuple[int, int]] = None,
+        dynamic_k: bool = False,
+        min_k_ratio: float = 0.1,
+        max_k_ratio: float = 0.7,
     ):
         super().__init__()
         self.norm1 = norm_layer(dim)
@@ -331,6 +481,9 @@ class SparseVisionTransformerBlock(nn.Module):
                 qkv_bias=qkv_bias,
                 attn_drop=attn_drop,
                 proj_drop=drop,
+                dynamic_k=dynamic_k,
+                min_k_ratio=min_k_ratio,
+                max_k_ratio=max_k_ratio,
             )
         elif attention_type == "mixed":
             self.attn = MixedSparseAttention(
@@ -344,6 +497,9 @@ class SparseVisionTransformerBlock(nn.Module):
                 proj_drop=drop,
                 use_rel_pos=use_rel_pos,
                 input_size=input_size,
+                dynamic_k=dynamic_k,
+                min_k_ratio=min_k_ratio,
+                max_k_ratio=max_k_ratio,
             )
         else:
             raise ValueError(f"不支持的注意力类型: {attention_type}")
@@ -450,6 +606,7 @@ def get_rel_pos(q_size: int, k_size: int, rel_pos: torch.Tensor) -> torch.Tensor
     max_rel_dist = int(2 * max(q_size, k_size) - 1)
     # 必要时插值相对位置编码
     if rel_pos.shape[0] != max_rel_dist:
+        # 使用线性插值，适合1D数据
         rel_pos_resized = F.interpolate(
             rel_pos.reshape(1, rel_pos.shape[0], -1).permute(0, 2, 1),
             size=max_rel_dist,
@@ -459,10 +616,12 @@ def get_rel_pos(q_size: int, k_size: int, rel_pos: torch.Tensor) -> torch.Tensor
     else:
         rel_pos_resized = rel_pos
 
-    # 缩放坐标
-    q_coords = torch.arange(q_size)[:, None] * max(k_size / q_size, 1.0)
-    k_coords = torch.arange(k_size)[None, :] * max(q_size / k_size, 1.0)
-    relative_coords = (q_coords - k_coords) + (k_size - 1) * max(q_size / k_size, 1.0)
+    # 精确计算相对坐标
+    q_coords = torch.arange(q_size, device=rel_pos.device)[:, None]
+    k_coords = torch.arange(k_size, device=rel_pos.device)[None, :]
+    relative_coords = (q_coords - k_coords) + (k_size - 1)
+    # 确保坐标在有效范围内
+    relative_coords = torch.clamp(relative_coords, 0, max_rel_dist - 1)
 
     return rel_pos_resized[relative_coords.long()]
 
@@ -480,15 +639,30 @@ def add_decomposed_rel_pos(
     Rh = get_rel_pos(q_h, k_h, rel_pos_h)
     Rw = get_rel_pos(q_w, k_w, rel_pos_w)
 
-    B, _, dim = q.shape
-    r_q = q.reshape(B, q_h, q_w, dim)
-    rel_h = torch.einsum("bhwc,hkc->bhwk", r_q, Rh)
-    rel_w = torch.einsum("bhwc,wkc->bhwk", r_q, Rw)
+    # 检查q的形状，处理包含注意力头维度的情况
+    if len(q.shape) == 4:
+        # 形状为 (B, num_heads, q_h*q_w, dim)
+        B, num_heads, _, dim = q.shape
+        r_q = q.reshape(B, num_heads, q_h, q_w, dim)
+        rel_h = torch.einsum("bnhwc,hkc->bnhwk", r_q, Rh)
+        rel_w = torch.einsum("bnhwc,wkc->bnhwk", r_q, Rw)
 
-    attn = (
-        attn.view(B, q_h, q_w, k_h, k_w)
-        + rel_h[:, :, :, :, None]
-        + rel_w[:, :, :, None, :]
-    ).view(B, q_h * q_w, k_h * k_w)
+        attn = (
+            attn.view(B, num_heads, q_h, q_w, k_h, k_w)
+            + rel_h[:, :, :, :, :, None]
+            + rel_w[:, :, :, :, None, :]
+        ).view(B, num_heads, q_h * q_w, k_h * k_w)
+    else:
+        # 原始形状 (B, q_h*q_w, dim)
+        B, _, dim = q.shape
+        r_q = q.reshape(B, q_h, q_w, dim)
+        rel_h = torch.einsum("bhwc,hkc->bhwk", r_q, Rh)
+        rel_w = torch.einsum("bhwc,wkc->bhwk", r_q, Rw)
+
+        attn = (
+            attn.view(B, q_h, q_w, k_h, k_w)
+            + rel_h[:, :, :, :, None]
+            + rel_w[:, :, :, None, :]
+        ).view(B, q_h * q_w, k_h * k_w)
 
     return attn

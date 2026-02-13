@@ -29,10 +29,22 @@ class SparseVisionTransformer(nn.Module):
         local_head_ratio: float = 0.6,
         use_window_shift: bool = True,
         shift_period: int = 2,
+        dynamic_k: bool = False,  # 启用动态k值调整
+        min_k_ratio: float = 0.1,  # 最小k值比例
+        max_k_ratio: float = 0.7,  # 最大k值比例
+        sparsity_level: float = 0.2,  # 注意力稀疏性控制（0.0-1.0）
         **kwargs
     ):
         super().__init__()
         self.num_features = self.embed_dim = embed_dim
+        
+        # 动态k值参数
+        self.dynamic_k = dynamic_k
+        self.min_k_ratio = min_k_ratio
+        self.max_k_ratio = max_k_ratio
+        
+        # 注意力稀疏性控制参数
+        self.sparsity_level = sparsity_level  # 0.0-1.0，控制稀疏程度
         
         # Patch嵌入层
         self.patch_embed = PatchEmbed(
@@ -77,10 +89,13 @@ class SparseVisionTransformer(nn.Module):
                     norm_layer=norm_layer,
                     attention_type=attention_type,
                     window_size=window_size,
-                    top_k_ratio=top_k_ratio,
-                    local_head_ratio=local_head_ratio,
+                    top_k_ratio=top_k_ratio * (1.0 - sparsity_level * 0.8),  # 根据稀疏性级别调整top_k_ratio
+                    local_head_ratio=local_head_ratio + sparsity_level * 0.2,  # 根据稀疏性级别调整local_head_ratio
                     use_rel_pos=True,
                     input_size=input_size,
+                    dynamic_k=dynamic_k,
+                    min_k_ratio=min_k_ratio,
+                    max_k_ratio=max_k_ratio,
                 )
             )
         

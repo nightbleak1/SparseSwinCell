@@ -9,13 +9,14 @@ SparseSwinCell是一个基于Vision Transformer的细胞分割系统，以Swin T
 ## 技术栈
 
 - **深度学习框架**: PyTorch
-- **计算机视觉库**: torchvision, OpenCV
+- **计算机视觉库**: torchvision, OpenCV, albumentations
 - **模型架构**: Swin Transformer V2, SparseSwinCell, 稀疏VIT
 - **数据集**: PanNuke, MoNuSeg
-- **损失函数**: BCEWithLogitsLoss, Focal Loss
+- **损失函数**: BCEWithLogitsLoss, Focal Loss, MSELoss, 边界感知损失
 - **优化器**: AdamW
 - **学习率调度**: CosineAnnealingLR
 - **混合精度训练**: AMP
+- **评估指标**: ARI, IoU, Boundary F1-Score, Macro-F1, Weighted-F1, PQ
 
 ## 模型架构
 
@@ -38,11 +39,15 @@ SparseSwinCell采用编码器-解码器架构，主要包含以下组件：
 #### 3. 多分支输出
 - **细胞核二进制映射**: 预测每个像素是否为细胞核（2通道）
 - **HV映射**: 预测每个细胞核像素的水平和垂直偏移（2通道），用于实例分割
+  - 增强型解码器，包含边界感知卷积
+  - 注意力融合机制，提高边界准确性
 - **细胞核类型映射**: 预测每个细胞核的类型（6通道）
+  - 增强型分类头，包含通道注意力机制
+  - 改进的特征融合，提高分类准确性
 - **组织类型预测**: 基于全局特征预测图像的组织类型（19通道）
   - 增强型分类头架构，包含BatchNorm、GELU激活和dropout层
   - 改进的特征处理，添加了dropout层提高泛化能力
-  - 更高的损失权重，确保模型充分关注组织分类任务
+  - 全局平均池化（GAP）层，捕获全局上下文信息
 
 ### 模型变体
 
@@ -59,6 +64,12 @@ SparseSwinCell采用编码器-解码器架构，主要包含以下组件：
 - **基于内容的稀疏性**: 根据特征内容动态调整注意力权重
 - **动态km attention**: 根据输入内容动态调整top-k比例
 - **全局稀疏性**: 跨层的稀疏策略协调
+
+### 模型复杂度
+
+- **总参数量 (Total Parameters)**: 97.89 M
+- **可训练参数 (Trainable Parameters)**: 97.89 M
+- **计算量 (FLOPs)**: 57.74 G (每张 256x256 输入图像)
 
 ## 数据处理
 
@@ -92,16 +103,36 @@ SparseSwinCell采用编码器-解码器架构，主要包含以下组件：
 - **损失函数**: 
   - BCEWithLogitsLoss（用于二进制分割任务）
   - CrossEntropyLoss（用于细胞核类型和组织类型分类）
-    - 组织分类损失权重: 2.0（提高模型对组织分类的关注度）
+  - MSELoss（用于HV映射预测）
+  - Focal Loss（用于细胞核类型分类，处理类别不平衡）
+  - 边界感知损失（用于HV映射预测，增强边界准确性）
 - **优化器**: AdamW，初始学习率1e-4
 - **学习率调度**: CosineAnnealingLR
-- **批量大小**: 32（可根据GPU内存调整）
+- **批量大小**: 18（可根据GPU内存调整，支持梯度累积）
 - **混合精度训练**: FP16
 - **早期停止**: 监控验证指标，当性能不再提升时停止训练
 - **CUDA优化**: 
   - 启用cuDNN自动调优
   - 增加workers数量，加速数据加载
   - 启用persistent_workers和prefetch_factor，优化数据预取
+  - 启用TF32加速，提高计算速度
+- **权重调整策略**: 四阶段渐进式调整
+  - 第一阶段（50-60 epoch）：稳步强化核心损失，温和弱化非核心损失
+  - 第二阶段（60-70 epoch）：暂停核心损失大幅调整，针对性强化边界
+  - 第三阶段（70-90 epoch）：核心损失达目标后稳定，动态适配分类指标
+  - 第四阶段（90轮后）：聚焦边界损失，大幅降低其他损失权重
+    - 边界损失：1.5（基础值）→ 连续 3 轮无提升则调至 1.6（最高 1.7）
+    - nuclei_binary_map (BCE)：1.0（恢复实例分割基础）
+    - hv_map (MSE)：1.0（提升辅助分割权重）
+    - nuclei_type_map (CE)：2.0（保持高分类权重）
+    - tissue_types (CE)：1.0（提升组织分类权重，提供语义上下文）
+    - edge_map (Shape Stream)：2.0（进一步强化边缘）
+    - 学习率：Epoch 100-120 进行线性衰减 (Linear Decay) 从 1e-5 降至 5e-6
+    - **特殊处理 (Dead/Connective)**: 
+      - Dead 细胞权重强制设为 5.0，Connective 细胞权重强制设为 1.5
+      - 组织类型 Loss 根据逆频率自动加权（如 Kidney ~3.1, Breast ~0.18）
+- **Focal Loss动态调整**: 根据验证集Macro-F1变化自动调整权重
+- **时间戳日志目录**: 每次训练自动创建唯一的时间戳日志目录，避免日志冲突
 
 ### 从头训练
 
@@ -114,6 +145,16 @@ cd /hy-tmp/SparseSwinCell && python cell_segmentation/trainer/train_from_scratch
 ### 断点续训
 
 支持从检查点恢复训练，自动保存最佳模型、最新模型和定期检查点。
+
+#### 从特定检查点恢复训练
+
+```bash
+# 从第50轮检查点恢复训练
+cd /hy-tmp/SparseSwinCell && python cell_segmentation/trainer/train_from_scratch.py --resume --checkpoint logs/train_cellvit_from_scratch/checkpoint_epoch_50.pth
+
+# 从最近的断点恢复训练
+cd /hy-tmp/SparseSwinCell && python cell_segmentation/trainer/train_from_scratch.py --resume --checkpoint logs/train_cellvit_20260203_010235/latest_checkpoint.pth
+```
 
 ## 项目结构
 
@@ -255,19 +296,47 @@ cd SparseSwinCell && python cell_segmentation/inference.py --checkpoint <path_to
 5. **增强组织分类**: 
    - 改进组织分类头架构，添加BatchNorm、GELU激活和dropout层
    - 增强特征处理，添加dropout层提高泛化能力
-6. **CUDA优化**: 
+   - 全局平均池化（GAP）层，捕获全局上下文信息
+6. **增强HV映射预测**: 
+   - 增强型解码器，包含边界感知卷积
+   - 注意力融合机制，提高边界准确性
+   - 边界感知损失函数，针对性强化边界特征学习
+7. **增强细胞核类型分类**: 
+   - 增强型分类头，包含通道注意力机制
+   - 改进的特征融合，提高分类准确性
+   - Focal Loss，处理类别不平衡问题
+8. **四阶段权重调整策略**: 
+   - 第一阶段（50-60 epoch）：稳步强化核心损失，温和弱化非核心损失
+   - 第二阶段（60-70 epoch）：暂停核心损失大幅调整，针对性强化边界
+   - 第三阶段（70-90 epoch）：核心损失达目标后稳定，动态适配分类指标
+   - 第四阶段（90轮后）：聚焦边界损失，大幅降低其他损失权重
+9. **Focal Loss动态调整**: 根据验证集Macro-F1变化自动调整权重
+10. **时间戳日志目录**: 每次训练自动创建唯一的时间戳日志目录，避免日志冲突
+11. **CUDA优化**: 
     - 启用cuDNN自动调优，加速卷积运算
     - 增加workers数量，提高数据加载速度
     - 启用persistent_workers和prefetch_factor，优化数据预取
+    - 启用TF32加速，提高计算速度
     - 可根据GPU内存调整批量大小
+12. **类别不平衡处理 (Class Imbalance Handling)**:
+    - 使用 `WeightedRandomSampler` 进行基于组织和细胞类型的平衡采样
+    - 动态损失重加权 (Dynamic Loss Re-weighting)：
+      - 组织类型：逆频率加权（如 Kidney ~3.1, Breast ~0.18）
+      - 细胞核类型：针对稀缺类别（Dead: 5.0）和难分类别（Connective: 1.5）进行特殊强化
+13. **小目标召回优化 (Small Object Recall Optimization)**:
+    - 调整后处理阈值 (`min_size` 从 10 降至 5)，显著提升微小细胞（如 Dead, Connective）的召回率
+14. **精细化训练策略 (Refined Training Strategy)**:
+    - 延长训练周期至 120 Epoch
+    - 线性学习率衰减 (Linear Decay)：Epoch 100-120 从 1e-5 降至 5e-6，确保 Loss 面底端的平稳收敛
 
 ## 评估指标
 
 模型使用以下指标进行评估：
 
 - **细胞核分割**: IoU, F1分数
-- **细胞核类型分类**: 准确率, F1分数
-- **实例分割**: PQ (Panoptic Quality), AP (Average Precision)
+- **细胞核类型分类**: 准确率, Macro-F1, Weighted-F1
+- **实例分割**: PQ (Panoptic Quality), AP (Average Precision), ARI (Adjusted Rand Index)
+- **边界准确性**: Boundary F1-Score
 - **组织类型分类**: 准确率, F1分数
 
 ## 许可证
