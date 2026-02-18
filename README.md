@@ -132,6 +132,66 @@ python cell_segmentation/inference/cell_detection_mp.py process_dataset \
 
 ---
 
+## 🔬 消融实验 (Ablation Study)
+
+为了验证各个核心组件的贡献，我们提供了完整的消融实验框架，可以系统地评估每个模块对性能的影响。
+
+### 实验配置
+| 配置名称 | 说明 | 移除的组件 |
+|---------|------|-----------|
+| `full_model` | 完整模型（基准） | 无 |
+| `no_sparse_attention` | 无稀疏注意力 | 稀疏注意力机制 |
+| `no_shape_stream` | 无形状流 | 边界检测分支 |
+| `no_aspp` | 无 ASPP | 空洞空间金字塔池化 |
+| `no_attention_gates` | 无注意力门 | 注意力门机制 |
+
+### 运行消融实验
+
+#### 1. 查看可用配置
+```bash
+python cell_segmentation/trainer/ablation_study.py --list
+```
+
+#### 2. 运行单个消融实验
+```bash
+# 运行无稀疏注意力的实验
+python cell_segmentation/trainer/ablation_study.py --ablation no_sparse_attention
+
+# 运行无形状流的实验
+python cell_segmentation/trainer/ablation_study.py --ablation no_shape_stream
+
+# 运行无 ASPP 的实验
+python cell_segmentation/trainer/ablation_study.py --ablation no_aspp
+
+# 运行无注意力门的实验
+python cell_segmentation/trainer/ablation_study.py --ablation no_attention_gates
+```
+
+#### 3. 批量运行所有消融实验
+```bash
+./run_ablation_experiments.sh
+```
+
+#### 4. 分析实验结果
+```bash
+python cell_segmentation/trainer/analyze_ablation_results.py
+```
+
+### 消融实验输出
+每个实验会在 `./logs/` 目录下生成独立的日志文件夹，包含：
+- 训练检查点
+- 实验结果摘要 (`ablation_results.txt`)
+- 可视化图像
+
+运行分析脚本后，会在 `./ablation_analysis/` 目录生成：
+- 性能对比柱状图
+- 相对性能对比图
+- 详细总结报告 (`ablation_summary_report.txt`)
+
+详细使用指南请参考 [ABLATION_STUDY_GUIDE.md](./ABLATION_STUDY_GUIDE.md)
+
+---
+
 ## 📊 性能指标 (Metrics)
 
 模型在测试时会自动计算以下指标：
@@ -146,18 +206,24 @@ python cell_segmentation/inference/cell_detection_mp.py process_dataset \
 
 ```text
 SparseSwinCell/
-├── base_ml/                   # 基础训练框架
+├── base_ml/                           # 基础训练框架
 ├── cell_segmentation/
-│   ├── datasets/              # 数据集加载与预处理 (PanNuke, CoNSeP)
-│   ├── inference/             # 推理脚本 (WSI, Experiment Evaluation)
-│   ├── models/                # 模型定义
-│   │   ├── backbone/          # Swin Transformer V2
-│   │   ├── cellvit.py         # 基础模型结构
-│   │   └── sparse_cellvit.py  # 稀疏化与多任务实现
-│   ├── trainer/               # 训练逻辑 (Trainer, Loss, Scheduler)
-│   └── utils/                 # 指标计算与后处理
-├── configs/                   # 实验配置文件
-└── logs/                      # 训练日志与模型权重
+│   ├── datasets/                      # 数据集加载与预处理 (PanNuke, CoNSeP)
+│   ├── inference/                     # 推理脚本 (WSI, Experiment Evaluation)
+│   ├── models/                        # 模型定义
+│   │   ├── backbone/                  # Swin Transformer V2
+│   │   ├── cellvit.py                 # 基础模型结构
+│   │   └── sparse_cellvit.py          # 稀疏化与多任务实现
+│   ├── trainer/                       # 训练逻辑
+│   │   ├── train_from_scratch.py     # 主训练脚本
+│   │   ├── ablation_study.py         # 消融实验训练脚本
+│   │   └── analyze_ablation_results.py # 消融实验结果分析
+│   └── utils/                         # 指标计算与后处理
+├── configs/                           # 实验配置文件
+├── logs/                              # 训练日志与模型权重
+├── ablation_analysis/                 # 消融实验分析结果（运行后生成）
+├── ABLATION_STUDY_GUIDE.md           # 消融实验详细指南
+└── run_ablation_experiments.sh        # 批量运行消融实验脚本
 ```
 
 ## 📝 许可证与引用

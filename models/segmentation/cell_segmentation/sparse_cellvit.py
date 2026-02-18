@@ -587,6 +587,9 @@ class SparseCellViT(nn.Module):
         min_k_ratio: float = 0.1,
         max_k_ratio: float = 0.7,
         sparsity_level: float = 0.2,
+        use_shape_stream: bool = True,
+        use_aspp: bool = True,
+        use_attention_gates: bool = True,
     ):
         super().__init__()
         
@@ -613,9 +616,11 @@ class SparseCellViT(nn.Module):
         self.min_k_ratio = min_k_ratio
         self.max_k_ratio = max_k_ratio
         self.sparsity_level = sparsity_level
+        self.use_shape_stream = use_shape_stream
+        self.use_aspp = use_aspp
+        self.use_attention_gates = use_attention_gates
         
         # 1. Backbone: Swin Transformer V2
-        # 增加参数量以提升性能
         total_depth = sum([1, 1, 3, 1])
         if depth != total_depth:
             scale_factor = depth / total_depth
@@ -649,12 +654,20 @@ class SparseCellViT(nn.Module):
         self.bottleneck_dim = self.swin_dims[-1] // 2
         
         # 2. Advanced Feature Aggregation: ASPP
-        # 位于 Backbone 输出 (z4) 之后，捕捉多尺度上下文
-        self.aspp = ASPP(self.swin_dims[-1], self.bottleneck_dim)
+        if self.use_aspp:
+            self.aspp = ASPP(self.swin_dims[-1], self.bottleneck_dim)
+        else:
+            self.aspp = nn.Sequential(
+                nn.Conv2d(self.swin_dims[-1], self.bottleneck_dim, kernel_size=1),
+                nn.BatchNorm2d(self.bottleneck_dim),
+                nn.ReLU(inplace=True)
+            )
         
         # 3. Shape Stream for Boundary Detection
-        # 独立的轻量级分支，专注于边缘检测
-        self.shape_stream = ShapeStream(self.swin_dims[0]) # 从浅层特征开始
+        if self.use_shape_stream:
+            self.shape_stream = ShapeStream(self.swin_dims[0])
+        else:
+            self.shape_stream = None
 
         # 4. Classification Head (Tissue)
         self.tissue_head = nn.Sequential(
@@ -682,12 +695,14 @@ class SparseCellViT(nn.Module):
         )
         
         # Attention Gates for Skip Connections
-        # z3 (16x16) <-> decoder3 (16x16)
-        self.ag3 = AttentionGate(F_g=self.bottleneck_dim, F_l=self.swin_dims[-2], F_int=self.bottleneck_dim // 2)
-        # z2 (32x32) <-> decoder2 (32x32)
-        self.ag2 = AttentionGate(F_g=256, F_l=self.swin_dims[-3], F_int=128)
-        # z1 (64x64) <-> decoder1 (64x64)
-        self.ag1 = AttentionGate(F_g=128, F_l=self.swin_dims[-4], F_int=64)
+        if self.use_attention_gates:
+            self.ag3 = AttentionGate(F_g=self.bottleneck_dim, F_l=self.swin_dims[-2], F_int=self.bottleneck_dim // 2)
+            self.ag2 = AttentionGate(F_g=256, F_l=self.swin_dims[-3], F_int=128)
+            self.ag1 = AttentionGate(F_g=128, F_l=self.swin_dims[-4], F_int=64)
+        else:
+            self.ag3 = None
+            self.ag2 = None
+            self.ag1 = None
 
 
     def forward(self, x: torch.Tensor, retrieve_tokens: bool = False) -> dict:
@@ -716,16 +731,16 @@ class SparseCellViT(nn.Module):
         bottleneck_feat = self.aspp(z4)
         
         # 4. Shape Stream Forward (using shallow feature z1)
-        # z1 is [B, 96, 64, 64]
-        shape_feat, edge_map = self.shape_stream(z1)
-        
-        # Upsample edge_map to original input size
-        if original_shape is not None:
-             edge_map = F.interpolate(edge_map, size=original_shape, mode='bilinear', align_corners=False)
-        else:
-             edge_map = F.interpolate(edge_map, size=(H, W), mode='bilinear', align_corners=False)
+        shape_feat = None
+        if self.use_shape_stream and self.shape_stream is not None:
+            shape_feat, edge_map = self.shape_stream(z1)
+            
+            if original_shape is not None:
+                 edge_map = F.interpolate(edge_map, size=original_shape, mode='bilinear', align_corners=False)
+            else:
+                 edge_map = F.interpolate(edge_map, size=(H, W), mode='bilinear', align_corners=False)
 
-        out_dict["edge_map"] = edge_map # Output edge map for auxiliary loss
+            out_dict["edge_map"] = edge_map
 
         # 5. Decoders
         if self.regression_loss:
@@ -773,22 +788,28 @@ class SparseCellViT(nn.Module):
         b4 = branch_decoder.bottleneck_upsampler(bottleneck)
         
         # Attention Gate 3
-        # z3: [B, 384, 16, 16]
-        z3_gated = self.ag3(g=b4, x=z3)
+        if self.use_attention_gates and self.ag3 is not None:
+            z3_gated = self.ag3(g=b4, x=z3)
+        else:
+            z3_gated = z3
         b3_concat = torch.cat([z3_gated, b4], dim=1)
-        b3 = branch_decoder.decoder3_upsampler(b3_concat) # -> [B, 256, 32, 32]
+        b3 = branch_decoder.decoder3_upsampler(b3_concat)
         
         # Attention Gate 2
-        # z2: [B, 192, 32, 32]
-        z2_gated = self.ag2(g=b3, x=z2)
+        if self.use_attention_gates and self.ag2 is not None:
+            z2_gated = self.ag2(g=b3, x=z2)
+        else:
+            z2_gated = z2
         b2_concat = torch.cat([z2_gated, b3], dim=1)
-        b2 = branch_decoder.decoder2_upsampler(b2_concat) # -> [B, 128, 64, 64]
+        b2 = branch_decoder.decoder2_upsampler(b2_concat)
         
         # Attention Gate 1
-        # z1: [B, 96, 64, 64]
-        z1_gated = self.ag1(g=b2, x=z1)
+        if self.use_attention_gates and self.ag1 is not None:
+            z1_gated = self.ag1(g=b2, x=z1)
+        else:
+            z1_gated = z1
         b1_concat = torch.cat([z1_gated, b2], dim=1)
-        b1 = branch_decoder.decoder1_upsampler(b1_concat) # -> [B, 64, 128, 128]
+        b1 = branch_decoder.decoder1_upsampler(b1_concat)
         
         # Upsample to full resolution
         b1_up = F.interpolate(b1, size=(z0.shape[2], z0.shape[3]), mode='bilinear', align_corners=False)
