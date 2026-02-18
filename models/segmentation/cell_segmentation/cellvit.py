@@ -679,30 +679,75 @@ class CellViT(nn.Module):
         """
         # For Swin Transformer, we need to ensure proper upsampling to match dimensions
         
+        # 定义注意力融合模块
+        def attention_fusion(f1, f2):
+            """注意力融合两个特征图
+            
+            Args:
+                f1: 第一个特征图
+                f2: 第二个特征图
+                
+            Returns:
+                融合后的特征图
+            """
+            # 确保两个特征图的空间维度相同
+            if f1.shape[2:] != f2.shape[2:]:
+                f1 = torch.nn.functional.interpolate(f1, size=f2.shape[2:], mode='bilinear', align_corners=False)
+            
+            # 确保两个特征图的通道数相同
+            if f1.shape[1] != f2.shape[1]:
+                # 使用 1x1 卷积将通道数调整为较大的那个
+                target_channels = max(f1.shape[1], f2.shape[1])
+                if f1.shape[1] < target_channels:
+                    f1 = nn.Conv2d(f1.shape[1], target_channels, kernel_size=1, stride=1, padding=0).to(f1.device)(f1)
+                if f2.shape[1] < target_channels:
+                    f2 = nn.Conv2d(f2.shape[1], target_channels, kernel_size=1, stride=1, padding=0).to(f2.device)(f2)
+            
+            # 计算通道注意力
+            combined = torch.cat([f1, f2], dim=1)
+            avg_pool = torch.mean(combined, dim=(2, 3), keepdim=True)
+            max_pool = torch.amax(combined, dim=(2, 3), keepdim=True)
+            
+            # 注意力网络
+            attention = torch.cat([avg_pool, max_pool], dim=1)
+            attention = nn.Conv2d(attention.shape[1], attention.shape[1] // 4, kernel_size=1, stride=1, padding=0).to(attention.device)(attention)
+            attention = nn.ReLU()(attention)
+            attention = nn.Conv2d(attention.shape[1], 2, kernel_size=1, stride=1, padding=0).to(attention.device)(attention)
+            attention = nn.Softmax(dim=1)(attention)
+            
+            # 应用注意力权重
+            f1_weighted = f1 * attention[:, 0:1, :, :]
+            f2_weighted = f2 * attention[:, 1:2, :, :]
+            
+            return f1_weighted + f2_weighted
+        
         # Step 1: Process bottleneck (z4) and upsample to match z3
         b4 = branch_decoder.bottleneck_upsampler(z4)  # z4 (8x8) -> b4 (16x16)
         
-        # Step 2: Concatenate z3 and b4, then upsample to match z2
-        # z3 is 16x16, b4 is 16x16, after concatenation -> 32x32
-        b3_concat = torch.cat([z3, b4], dim=1)
+        # Step 2: 使用注意力机制融合 z3 和 b4，然后 upsample 到 match z2
+        # z3 is 16x16, b4 is 16x16
+        fused_z3_b4 = attention_fusion(z3, b4)
+        b3_concat = torch.cat([z3, fused_z3_b4], dim=1)
         b3 = branch_decoder.decoder3_upsampler(b3_concat)  # 16x16 -> 32x32
         
-        # Step 3: Concatenate z2 and b3, then upsample to match z1
-        # z2 is 32x32, b3 is 32x32, after concatenation -> 64x64
-        b2_concat = torch.cat([z2, b3], dim=1)
+        # Step 3: 使用注意力机制融合 z2 和 b3，然后 upsample 到 match z1
+        # z2 is 32x32, b3 is 32x32
+        fused_z2_b3 = attention_fusion(z2, b3)
+        b2_concat = torch.cat([z2, fused_z2_b3], dim=1)
         b2 = branch_decoder.decoder2_upsampler(b2_concat)  # 32x32 -> 64x64
         
-        # Step 4: Concatenate z1 and b2, then upsample to match z0
-        # z1 is 64x64, b2 is 64x64, after concatenation -> 128x128
-        b1_concat = torch.cat([z1, b2], dim=1)
+        # Step 4: 使用注意力机制融合 z1 和 b2，然后 upsample 到 match z0
+        # z1 is 64x64, b2 is 64x64
+        fused_z1_b2 = attention_fusion(z1, b2)
+        b1_concat = torch.cat([z1, fused_z1_b2], dim=1)
         b1 = branch_decoder.decoder1_upsampler(b1_concat)  # 64x64 -> 128x128
         
         # Step 5: Upsample b1 to match z0 size
         b1 = torch.nn.functional.interpolate(b1, size=(z0.shape[2], z0.shape[3]), mode='bilinear', align_corners=False)  # 128x128 -> 256x256
         
-        # Step 6: Concatenate input image (z0) directly with b1, then pass through decoder0_header
-        # z0 is 3 channels, b1 is 64 channels, total 3+64=67 channels which matches decoder0_header expectation
-        b0_concat = torch.cat([z0, b1], dim=1)
+        # Step 6: 使用注意力机制融合 z0 和 b1，然后通过 decoder0_header
+        fused_z0_b1 = attention_fusion(z0, b1)
+        b0_concat = torch.cat([z0, fused_z0_b1], dim=1)
         branch_output = branch_decoder.decoder0_header(b0_concat)
 
         return branch_output
@@ -776,17 +821,81 @@ class CellViT(nn.Module):
         )
         
         # Final header block
-        decoder0_header = nn.Sequential(
-            Conv2DBlock(self.input_channels + 64, 64, dropout=self.drop_rate),
-            Conv2DBlock(64, 64, dropout=self.drop_rate),
-            nn.Conv2d(
-                in_channels=64,
-                out_channels=num_classes,
-                kernel_size=1,
-                stride=1,
-                padding=0,
-            ),
-        )
+        # 为细胞核类型分类添加更强大的分类头
+        if num_classes == self.num_nuclei_classes:
+            # 细胞核类型分类头 - 增强版本
+            # 创建带有注意力机制的分类头
+            class AttentionBlock(nn.Module):
+                def __init__(self, in_channels):
+                    super().__init__()
+                    self.avg_pool = nn.AdaptiveAvgPool2d(1)
+                    self.fc = nn.Sequential(
+                        nn.Conv2d(in_channels, in_channels // 4, kernel_size=1),
+                        nn.ReLU(),
+                        nn.Conv2d(in_channels // 4, in_channels, kernel_size=1),
+                        nn.Sigmoid()
+                    )
+                
+                def forward(self, x):
+                    attention = self.avg_pool(x)
+                    attention = self.fc(attention)
+                    return x * attention
+            
+            decoder0_header = nn.Sequential(
+                Conv2DBlock(self.input_channels + 64, 128, 3, dropout=self.drop_rate),
+                Conv2DBlock(128, 128, 3, dropout=self.drop_rate),
+                # 添加通道注意力机制
+                AttentionBlock(128),
+                Conv2DBlock(128, 64, 3, dropout=self.drop_rate),
+                Conv2DBlock(64, 64, 3, dropout=self.drop_rate),
+                nn.Conv2d(
+                    in_channels=64,
+                    out_channels=num_classes,
+                    kernel_size=1,
+                    stride=1,
+                    padding=0,
+                ),
+            )
+        # 为 HV 映射添加专门的处理
+        elif num_classes == 2:
+            # HV 映射解码器 - 增强版本
+            decoder0_header = nn.Sequential(
+                Conv2DBlock(self.input_channels + 64, 128, 3, dropout=self.drop_rate),
+                Conv2DBlock(128, 128, 3, dropout=self.drop_rate),
+                Conv2DBlock(128, 64, 3, dropout=self.drop_rate),
+                Conv2DBlock(64, 64, 3, dropout=self.drop_rate),
+                # 添加边界感知卷积
+                nn.Conv2d(
+                    in_channels=64,
+                    out_channels=64,
+                    kernel_size=3,
+                    stride=1,
+                    padding=1,
+                    groups=64
+                ),
+                nn.BatchNorm2d(64),
+                nn.ReLU(),
+                nn.Conv2d(
+                    in_channels=64,
+                    out_channels=num_classes,
+                    kernel_size=1,
+                    stride=1,
+                    padding=0,
+                ),
+            )
+        else:
+            # 其他分支保持不变
+            decoder0_header = nn.Sequential(
+                Conv2DBlock(self.input_channels + 64, 64, dropout=self.drop_rate),
+                Conv2DBlock(64, 64, dropout=self.drop_rate),
+                nn.Conv2d(
+                    in_channels=64,
+                    out_channels=num_classes,
+                    kernel_size=1,
+                    stride=1,
+                    padding=0,
+                ),
+            )
 
         decoder = nn.Sequential(
             OrderedDict(
@@ -1223,7 +1332,7 @@ class DataclassHVStorage:
 
     def get_dict(self) -> dict:
         """Return dictionary of entries"""
-        property_dict = self.__dict__
+        property_dict = self.__dict__.copy()
         if not self.regression_loss and "regression_map" in property_dict.keys():
             property_dict.pop("regression_map")
         return property_dict

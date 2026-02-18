@@ -23,7 +23,7 @@ gpu: 0                           # 使用的 GPU 编号（单卡训练）
 # 数据集配置
 data:
   dataset: PanNuke               # 数据集名称（支持 PanNuke/Conic）
-  dataset_path: /hy-tmp/project/cell_segmentation/datasets/process/PanNuke  # 更正为正确的数据集路径
+  dataset_path: /hy-tmp/SparseSwinCell/cell_segmentation/datasets/process/PanNuke  # 数据集路径
   train_folds: [0, 1, 2]         # 训练集包含 fold0、fold1、fold2
   val_split: 0.1                 # 从训练集中抽取 10% 作为验证集
   test_split: 0.1                # 从训练集中抽取 10% 作为测试集
@@ -34,7 +34,7 @@ data:
 # 模型配置
 model:
   backbone: sparse_vit256        # 使用稀疏自注意力ViT256
-  pretrained_encoder: /hy-tmp/project/models/pretrained/vit256_small_dino.pth  # 预训练编码器路径
+  pretrained_encoder: null  # 暂时不使用预训练编码器
   shared_skip_connections: true  # 共享跳跃连接（提升分割精度）
   embed_dim: 384                 # ViT 嵌入维度（ViT-S 对应 384）
   depth: 12                      # Transformer 块数量（ViT-S 对应 12）

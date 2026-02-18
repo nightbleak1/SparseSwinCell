@@ -270,7 +270,7 @@ class PanNukeDataset(CellDataset):
         self.regression = regression
         
         # 初始化染色归一化器
-        self.stain_normalizer = self.StainNormalizer(alpha=0.5, beta=0.5)
+        # self.stain_normalizer = self.StainNormalizer(alpha=0.5, beta=0.5) # Disabled by user request
         
         # 加载numpy数组数据（PanNuke原格式）
         self.npy_data = {}
@@ -433,7 +433,7 @@ class PanNukeDataset(CellDataset):
             mask = self.load_maskfile(index)
 
         # 应用染色归一化（保持原格式）
-        img = self.stain_normalizer.transform(img)
+        # img = self.stain_normalizer.transform(img) # Disabled by user request
 
         if self.transforms is not None:
             transformed = self.transforms(image=img, mask=mask)
@@ -631,12 +631,44 @@ class PanNukeDataset(CellDataset):
         for tissue, count in tissue_counts.items():
             w = k / (gamma * count + (1 - gamma) * k)
             weights_dict[tissue] = w
+            
+        # Create ID to Name mapping if config exists
+        id_to_name = {}
+        if "tissue_types" in self.config:
+            for name, tid in self.config["tissue_types"].items():
+                id_to_name[tid] = name
 
         weights = []
         for idx in range(self.__len__()):
             img_idx = self.img_names[idx]
-            type_str = self.types[img_idx]
-            weights.append(weights_dict[type_str])
+            type_val = self.types[img_idx]
+            
+            # Handle if type_val is ID (int) or Name (str)
+            if isinstance(type_val, (int, np.integer)):
+                if type_val in id_to_name:
+                    type_str = id_to_name[type_val]
+                    # Try direct match or case-insensitive match in weights_dict
+                    if type_str in weights_dict:
+                        weights.append(weights_dict[type_str])
+                    else:
+                        # Try finding key ignoring case
+                        found = False
+                        for k_w in weights_dict.keys():
+                            if k_w.lower() == type_str.lower():
+                                weights.append(weights_dict[k_w])
+                                found = True
+                                break
+                        if not found:
+                            weights.append(1.0) # Fallback
+                else:
+                    weights.append(1.0) # Fallback
+            else:
+                # Assuming it is string
+                type_str = str(type_val)
+                if type_str in weights_dict:
+                    weights.append(weights_dict[type_str])
+                else:
+                     weights.append(1.0)
 
         return torch.Tensor(weights)
 

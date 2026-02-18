@@ -88,6 +88,8 @@ class CellViTTrainer(BaseTrainer):
         log_images: bool = False,
         magnification: int = 40,
         mixed_precision: bool = False,
+        gradient_clipping: bool = True,
+        max_grad_norm: float = 1.0,
     ):
         super().__init__(
             model=model,
@@ -110,6 +112,10 @@ class CellViTTrainer(BaseTrainer):
         self.reverse_tissue_types = {v: k for k, v in self.tissue_types.items()}
         self.nuclei_types = dataset_config["nuclei_types"]
         self.magnification = magnification
+        
+        # 梯度裁剪配置
+        self.gradient_clipping = gradient_clipping
+        self.max_grad_norm = max_grad_norm
 
         # setup logging objects
         self.loss_avg_tracker = {"Total_Loss": AverageMeter("Total_Loss", ":.4f")}
@@ -118,6 +124,15 @@ class CellViTTrainer(BaseTrainer):
                 self.loss_avg_tracker[f"{branch}_{loss_name}"] = AverageMeter(
                     f"{branch}_{loss_name}", ":.4f"
                 )
+        
+        # 添加额外的损失跟踪器
+        # 为细胞核类型分类添加 Focal Loss 跟踪器
+        if "nuclei_type_map" in self.loss_fn_dict:
+            self.loss_avg_tracker["nuclei_type_map_focal"] = AverageMeter("nuclei_type_map_focal", ":.4f")
+        
+        # 为 HV 映射添加边界感知损失跟踪器
+        if "hv_map" in self.loss_fn_dict:
+            self.loss_avg_tracker["hv_map_boundary"] = AverageMeter("hv_map_boundary", ":.4f")
         self.batch_avg_tissue_acc = AverageMeter("Batch_avg_tissue_ACC", ":4.f")
 
     def train_epoch(
@@ -144,6 +159,11 @@ class CellViTTrainer(BaseTrainer):
         cell_type_pq_scores = []
         tissue_pred = []
         tissue_gt = []
+        ari_scores = []
+        iou_scores = []
+        boundary_f1_scores = []
+        macro_f1_scores = []
+        weighted_f1_scores = []
         train_example_img = None
 
         # reset metrics
@@ -181,6 +201,11 @@ class CellViTTrainer(BaseTrainer):
             cell_type_pq_scores = (
                 cell_type_pq_scores + batch_metrics["cell_type_pq_scores"]
             )
+            ari_scores = ari_scores + batch_metrics["ari_scores"]
+            iou_scores = iou_scores + batch_metrics["iou_scores"]
+            boundary_f1_scores = boundary_f1_scores + batch_metrics["boundary_f1_scores"]
+            macro_f1_scores = macro_f1_scores + batch_metrics["macro_f1_scores"]
+            weighted_f1_scores = weighted_f1_scores + batch_metrics["weighted_f1_scores"]
             tissue_pred.append(batch_metrics["tissue_pred"])
             tissue_gt.append(batch_metrics["tissue_gt"])
             train_loop.set_postfix(
@@ -196,6 +221,11 @@ class CellViTTrainer(BaseTrainer):
         binary_dice_scores = np.array(binary_dice_scores)
         binary_jaccard_scores = np.array(binary_jaccard_scores)
         pq_scores = np.array(pq_scores)
+        ari_scores = np.array(ari_scores)
+        iou_scores = np.array(iou_scores)
+        boundary_f1_scores = np.array(boundary_f1_scores)
+        macro_f1_scores = np.array(macro_f1_scores)
+        weighted_f1_scores = np.array(weighted_f1_scores)
         tissue_detection_accuracy = accuracy_score(
             y_true=np.concatenate(tissue_gt), y_pred=np.concatenate(tissue_pred)
         )
@@ -208,6 +238,11 @@ class CellViTTrainer(BaseTrainer):
             "mPQ/Train": np.nanmean(
                 [np.nanmean(pq) for pq in cell_type_pq_scores]
             ),
+            "ARI/Train": np.nanmean(ari_scores),
+            "IoU/Train": np.nanmean(iou_scores),
+            "Boundary-F1/Train": np.nanmean(boundary_f1_scores),
+            "Nuclei-Type-Macro-F1/Train": np.nanmean(macro_f1_scores),
+            "Nuclei-Type-Weighted-F1/Train": np.nanmean(weighted_f1_scores),
             "Tissue-Multiclass-Accuracy/Train": tissue_detection_accuracy,
         }
 
@@ -224,6 +259,11 @@ class CellViTTrainer(BaseTrainer):
             f"Binary-Cell-Jacard: {np.nanmean(binary_jaccard_scores):.4f} - "
             f"bPQ-Score: {np.nanmean(pq_scores):.4f} - "
             f"mPQ-Score: {scalar_metrics['mPQ/Train']:.4f} - "
+            f"ARI: {np.nanmean(ari_scores):.4f} - "
+            f"IoU: {np.nanmean(iou_scores):.4f} - "
+            f"Boundary-F1: {np.nanmean(boundary_f1_scores):.4f} - "
+            f"Nuclei-Type-Macro-F1: {np.nanmean(macro_f1_scores):.4f} - "
+            f"Nuclei-Type-Weighted-F1: {np.nanmean(weighted_f1_scores):.4f} - "
             f"Tissue-MC-Acc.: {tissue_detection_accuracy:.4f}"
         )
 
@@ -269,6 +309,13 @@ class CellViTTrainer(BaseTrainer):
 
                 # calculate loss
                 total_loss = self.calculate_loss(predictions, gt)
+                
+                # 检查loss是否为NaN或Inf
+                if torch.isnan(total_loss) or torch.isinf(total_loss):
+                    self.logger.warning(f"Skipping batch {batch_idx} due to NaN/Inf loss: {total_loss.item()}")
+                    self.optimizer.zero_grad(set_to_none=True)
+                    self.model.zero_grad()
+                    return None, None
 
                 # backward pass
                 self.scaler.scale(total_loss).backward()
@@ -278,6 +325,11 @@ class CellViTTrainer(BaseTrainer):
                     or ((batch_idx + 1) == num_batches)
                     or (self.accum_iter == 1)
                 ):
+                    # 梯度裁剪，防止梯度爆炸
+                    if self.gradient_clipping:
+                        self.scaler.unscale_(self.optimizer)
+                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
+                    
                     self.scaler.step(self.optimizer)
                     self.scaler.update()
                     self.optimizer.zero_grad(set_to_none=True)
@@ -289,6 +341,13 @@ class CellViTTrainer(BaseTrainer):
 
             # calculate loss
             total_loss = self.calculate_loss(predictions, gt)
+            
+            # 检查loss是否为NaN或Inf
+            if torch.isnan(total_loss) or torch.isinf(total_loss):
+                self.logger.warning(f"Skipping batch {batch_idx} due to NaN/Inf loss: {total_loss.item()}")
+                self.optimizer.zero_grad(set_to_none=True)
+                self.model.zero_grad()
+                return None, None
 
             total_loss.backward()
             if (
@@ -296,6 +355,10 @@ class CellViTTrainer(BaseTrainer):
                 or ((batch_idx + 1) == num_batches)
                 or (self.accum_iter == 1)
             ):
+                # 梯度裁剪，防止梯度爆炸
+                if self.gradient_clipping:
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
+                
                 self.optimizer.step()
                 self.optimizer.zero_grad(set_to_none=True)
                 self.model.zero_grad()
@@ -336,6 +399,11 @@ class CellViTTrainer(BaseTrainer):
         cell_type_pq_scores = []
         tissue_pred = []
         tissue_gt = []
+        ari_scores = []
+        iou_scores = []
+        boundary_f1_scores = []
+        macro_f1_scores = []
+        weighted_f1_scores = []
         val_example_img = None
 
         # reset metrics
@@ -371,6 +439,11 @@ class CellViTTrainer(BaseTrainer):
                 cell_type_pq_scores = (
                     cell_type_pq_scores + batch_metrics["cell_type_pq_scores"]
                 )
+                ari_scores = ari_scores + batch_metrics["ari_scores"]
+                iou_scores = iou_scores + batch_metrics["iou_scores"]
+                boundary_f1_scores = boundary_f1_scores + batch_metrics["boundary_f1_scores"]
+                macro_f1_scores = macro_f1_scores + batch_metrics["macro_f1_scores"]
+                weighted_f1_scores = weighted_f1_scores + batch_metrics["weighted_f1_scores"]
                 tissue_pred.append(batch_metrics["tissue_pred"])
                 tissue_gt.append(batch_metrics["tissue_gt"])
                 val_loop.set_postfix(
@@ -388,6 +461,11 @@ class CellViTTrainer(BaseTrainer):
         binary_dice_scores = np.array(binary_dice_scores)
         binary_jaccard_scores = np.array(binary_jaccard_scores)
         pq_scores = np.array(pq_scores)
+        ari_scores = np.array(ari_scores)
+        iou_scores = np.array(iou_scores)
+        boundary_f1_scores = np.array(boundary_f1_scores)
+        macro_f1_scores = np.array(macro_f1_scores)
+        weighted_f1_scores = np.array(weighted_f1_scores)
         tissue_detection_accuracy = accuracy_score(
             y_true=np.concatenate(tissue_gt), y_pred=np.concatenate(tissue_pred)
         )
@@ -401,6 +479,11 @@ class CellViTTrainer(BaseTrainer):
             "mPQ/Validation": np.nanmean(
                 [np.nanmean(pq) for pq in cell_type_pq_scores]
             ),
+            "ARI/Validation": np.nanmean(ari_scores),
+            "IoU/Validation": np.nanmean(iou_scores),
+            "Boundary-F1/Validation": np.nanmean(boundary_f1_scores),
+            "Nuclei-Type-Macro-F1/Validation": np.nanmean(macro_f1_scores),
+            "Nuclei-Type-Weighted-F1/Validation": np.nanmean(weighted_f1_scores),
         }
 
         for branch, loss_fns in self.loss_fn_dict.items():
@@ -442,6 +525,11 @@ class CellViTTrainer(BaseTrainer):
             f"Binary-Cell-Jacard: {np.nanmean(binary_jaccard_scores):.4f} - "
             f"bPQ-Score: {np.nanmean(pq_scores):.4f} - "
             f"mPQ-Score: {scalar_metrics['mPQ/Validation']:.4f} - "
+            f"ARI: {np.nanmean(ari_scores):.4f} - "
+            f"IoU: {np.nanmean(iou_scores):.4f} - "
+            f"Boundary-F1: {np.nanmean(boundary_f1_scores):.4f} - "
+            f"Nuclei-Type-Macro-F1: {np.nanmean(macro_f1_scores):.4f} - "
+            f"Nuclei-Type-Weighted-F1: {np.nanmean(weighted_f1_scores):.4f} - "
             f"Tissue-MC-Acc.: {tissue_detection_accuracy:.4f}"
         )
 
@@ -670,13 +758,180 @@ class CellViTTrainer(BaseTrainer):
                     )
                 else:
                     loss_value = loss_fn(input=pred, target=gt[branch])
-                total_loss = total_loss + weight * loss_value
-                self.loss_avg_tracker[f"{branch}_{loss_name}"].update(
-                    loss_value.detach().cpu().numpy()
+                
+                # 为细胞核类型分类添加 Focal Loss
+                if branch == "nuclei_type_map":
+                    # 计算 Focal Loss
+                    focal_loss = self.calculate_focal_loss(pred, gt[branch])
+                    # 使用当前的 focal_weight，如果没有设置则使用默认值 1.5
+                    focal_weight = getattr(self, 'current_focal_weight', 1.5)
+                    total_loss += focal_weight * focal_loss  # 增加分类损失的权重
+                    self.loss_avg_tracker[f"{branch}_focal"].update(focal_loss.detach().cpu().numpy())
+                
+                # 为 HV 映射添加边界感知损失
+                elif branch == "hv_map":
+                    # 计算边界感知损失
+                    boundary_loss = self.calculate_boundary_loss(pred, gt[branch], gt["nuclei_binary_map"])
+                    # 使用当前的 boundary_weight，如果没有设置则使用默认值 0.5
+                    boundary_weight = getattr(self, 'current_boundary_weight', 0.5)
+                    total_loss += boundary_weight * boundary_loss  # 边界损失的权重
+                    self.loss_avg_tracker[f"{branch}_boundary"].update(boundary_loss.detach().cpu().numpy())
+            
+            total_loss = total_loss + weight * loss_value
+            self.loss_avg_tracker[f"{branch}_{loss_name}"].update(
+                loss_value.detach().cpu().numpy()
                 )
         self.loss_avg_tracker["Total_Loss"].update(total_loss.detach().cpu().numpy())
 
         return total_loss
+    
+    def calculate_focal_loss(self, pred, target, alpha=0.25, gamma=2.0):
+        """计算 Focal Loss
+        
+        Args:
+            pred: 模型预测的logits
+            target: 目标标签
+            alpha: 类别不平衡权重
+            gamma: 聚焦参数
+            
+        Returns:
+            Focal Loss值
+        """
+        # 确保pred和target形状匹配
+        if pred.shape != target.shape:
+            target = target[:, :pred.shape[1], :, :]
+        
+        BCE_loss = F.binary_cross_entropy_with_logits(pred, target, reduction='none')
+        pt = torch.exp(-BCE_loss)  # 防止溢出
+        focal_loss = alpha * (1 - pt) ** gamma * BCE_loss
+        return focal_loss.mean()
+    
+    def calculate_boundary_loss(self, pred_hv, gt_hv, gt_binary):
+        """计算边界感知损失
+        
+        Args:
+            pred_hv: 预测的HV映射
+            gt_hv: 目标HV映射
+            gt_binary: 二进制细胞核掩码
+            
+        Returns:
+            边界感知损失值
+        """
+        # 计算边界
+        boundary = self.get_boundary(gt_binary)
+        
+        # 只在边界区域计算损失
+        loss = F.mse_loss(pred_hv, gt_hv, reduction='none')
+        
+        # 边界加权：边界中心区域权重更高
+        boundary_weighted = boundary.unsqueeze(1) * (1 + torch.abs(pred_hv - gt_hv).mean(dim=1, keepdim=True))
+        loss = loss * boundary_weighted
+        
+        return loss.mean()
+    
+    def get_boundary(self, binary_mask):
+        """获取二值掩码的边界
+        
+        Args:
+            binary_mask: 二值掩码
+            
+        Returns:
+            边界掩码
+        """
+        # 使用Sobel算子计算边界
+        device = binary_mask.device
+        sobel_x = torch.Tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]]).to(device)
+        sobel_y = torch.Tensor([[1, 2, 1], [0, 0, 0], [-1, -2, -1]]).to(device)
+        
+        # 处理不同维度的输入
+        original_shape = binary_mask.shape
+        
+        # 确保输入是3D或4D张量
+        if len(original_shape) == 5:
+            # 对于5D张量 [B, C, D, H, W]，我们需要分别处理每个D维度
+            boundary = torch.zeros_like(binary_mask)
+            
+            # 遍历每个样本
+            for b in range(binary_mask.shape[0]):
+                # 遍历每个通道
+                for c in range(binary_mask.shape[1]):
+                    # 遍历每个D维度
+                    for d in range(binary_mask.shape[2]):
+                        # 提取 2D 掩码 [H, W]
+                        mask_2d = binary_mask[b, c, d].float().unsqueeze(0).unsqueeze(0)  # 变为 [1, 1, H, W]
+                        
+                        # 计算梯度
+                        dx = F.conv2d(mask_2d, sobel_x.unsqueeze(0).unsqueeze(0), padding=1)
+                        dy = F.conv2d(mask_2d, sobel_y.unsqueeze(0).unsqueeze(0), padding=1)
+                        
+                        # 计算边界
+                        boundary_map = torch.sqrt(dx**2 + dy**2).squeeze()
+                        boundary[b, c, d] = (boundary_map > 0.1).float()
+        
+        elif len(original_shape) == 4:
+            # 对于4D张量 [B, C, H, W]
+            boundary = torch.zeros_like(binary_mask)
+            
+            for b in range(binary_mask.shape[0]):
+                for c in range(binary_mask.shape[1]):
+                    mask_2d = binary_mask[b, c].float().unsqueeze(0).unsqueeze(0)  # 变为 [1, 1, H, W]
+                    dx = F.conv2d(mask_2d, sobel_x.unsqueeze(0).unsqueeze(0), padding=1)
+                    dy = F.conv2d(mask_2d, sobel_y.unsqueeze(0).unsqueeze(0), padding=1)
+                    boundary_map = torch.sqrt(dx**2 + dy**2).squeeze()
+                    boundary[b, c] = (boundary_map > 0.1).float()
+        
+        elif len(original_shape) == 3:
+            # 对于3D张量 [C, H, W]
+            boundary = torch.zeros_like(binary_mask)
+            
+            for c in range(binary_mask.shape[0]):
+                mask_2d = binary_mask[c].float().unsqueeze(0).unsqueeze(0)  # 变为 [1, 1, H, W]
+                dx = F.conv2d(mask_2d, sobel_x.unsqueeze(0).unsqueeze(0), padding=1)
+                dy = F.conv2d(mask_2d, sobel_y.unsqueeze(0).unsqueeze(0), padding=1)
+                boundary_map = torch.sqrt(dx**2 + dy**2).squeeze()
+                boundary[c] = (boundary_map > 0.1).float()
+        
+        else:
+            # 对于2D张量 [H, W]
+            mask_2d = binary_mask.float().unsqueeze(0).unsqueeze(0)  # 变为 [1, 1, H, W]
+            dx = F.conv2d(mask_2d, sobel_x.unsqueeze(0).unsqueeze(0), padding=1)
+            dy = F.conv2d(mask_2d, sobel_y.unsqueeze(0).unsqueeze(0), padding=1)
+            boundary_map = torch.sqrt(dx**2 + dy**2).squeeze()
+            boundary = (boundary_map > 0.1).float()
+        
+        return boundary
+    
+    def calculate_boundary_f1(self, pred_instance, gt_instance):
+        """计算边界 F1-Score
+        
+        Args:
+            pred_instance: 预测的实例掩码
+            gt_instance: 目标实例掩码
+            
+        Returns:
+            边界 F1-Score
+        """
+        # 将实例掩码转换为二值掩码
+        pred_binary = (pred_instance > 0).float()
+        gt_binary = (gt_instance > 0).float()
+        
+        # 计算边界
+        pred_boundary = self.get_boundary(pred_binary.unsqueeze(0))[0]
+        gt_boundary = self.get_boundary(gt_binary.unsqueeze(0))[0]
+        
+        # 计算 TP, FP, FN
+        TP = (pred_boundary * gt_boundary).sum().item()
+        FP = (pred_boundary * (1 - gt_boundary)).sum().item()
+        FN = ((1 - pred_boundary) * gt_boundary).sum().item()
+        
+        # 计算 F1-Score
+        if TP == 0:
+            return 0.0
+        precision = TP / (TP + FP + 1e-8)
+        recall = TP / (TP + FN + 1e-8)
+        f1 = 2 * (precision * recall) / (precision + recall + 1e-8)
+        
+        return f1
 
     def calculate_step_metric_train(
         self, predictions: DataclassHVStorage, gt: DataclassHVStorage
@@ -688,7 +943,8 @@ class CellViTTrainer(BaseTrainer):
             gt (DataclassHVStorage): Ground truth values
         Returns:
             dict: Dictionary with metrics. Keys:
-                binary_dice_scores, binary_jaccard_scores, pq_scores, cell_type_pq_scores, tissue_pred, tissue_gt
+                binary_dice_scores, binary_jaccard_scores, pq_scores, cell_type_pq_scores, tissue_pred, tissue_gt,
+                ari_scores, iou_scores, boundary_f1_scores, macro_f1_scores, weighted_f1_scores
         """
         predictions = predictions.get_dict()
         gt = gt.get_dict()
@@ -726,6 +982,11 @@ class CellViTTrainer(BaseTrainer):
         binary_jaccard_scores = []
         cell_type_pq_scores = []
         pq_scores = []
+        ari_scores = []
+        iou_scores = []
+        boundary_f1_scores = []
+        macro_f1_scores = []
+        weighted_f1_scores = []
 
         for i in range(len(pred_tissue)):
             # binary dice score: Score for cell detection per image, without background
@@ -738,7 +999,7 @@ class CellViTTrainer(BaseTrainer):
             )
             binary_dice_scores.append(float(cell_dice))
 
-            # binary aji
+            # binary jaccard (IoU)
             cell_jaccard = (
                 binary_jaccard_index(
                     preds=pred_binary_map,
@@ -748,12 +1009,48 @@ class CellViTTrainer(BaseTrainer):
                 .cpu()
             )
             binary_jaccard_scores.append(float(cell_jaccard))
+            iou_scores.append(float(cell_jaccard))
             
             # pq values
             remapped_instance_pred = remap_label(predictions["instance_map"][i])
             remapped_gt = remap_label(instance_maps_gt[i])
             [_, _, pq], _ = get_fast_pq(true=remapped_gt, pred=remapped_instance_pred)
             pq_scores.append(pq)
+            
+            # ARI (Adjusted Rand Index)
+            from sklearn.metrics import adjusted_rand_score
+            ari = adjusted_rand_score(
+                remapped_gt.flatten(),
+                remapped_instance_pred.flatten()
+            )
+            ari_scores.append(ari)
+            
+            # Boundary F1-Score
+            boundary_f1 = self.calculate_boundary_f1(
+                predictions["instance_map"][i],
+                instance_maps_gt[i]
+            )
+            boundary_f1_scores.append(boundary_f1)
+            
+            # Nuclei type classification metrics (Macro-F1 and Weighted-F1)
+            pred_nuclei_type = torch.argmax(predictions["nuclei_type_map"][i], dim=0).detach().cpu().numpy()
+            gt_nuclei_type = torch.argmax(gt["nuclei_type_map"][i], dim=0).detach().cpu().numpy()
+            
+            from sklearn.metrics import f1_score
+            macro_f1 = f1_score(
+                gt_nuclei_type.flatten(),
+                pred_nuclei_type.flatten(),
+                average='macro',
+                zero_division=0
+            )
+            weighted_f1 = f1_score(
+                gt_nuclei_type.flatten(),
+                pred_nuclei_type.flatten(),
+                average='weighted',
+                zero_division=0
+            )
+            macro_f1_scores.append(macro_f1)
+            weighted_f1_scores.append(weighted_f1)
 
             # pq values per class (skip background)
             nuclei_type_pq = []
@@ -785,6 +1082,11 @@ class CellViTTrainer(BaseTrainer):
             "cell_type_pq_scores": cell_type_pq_scores,
             "tissue_pred": pred_tissue,
             "tissue_gt": gt["tissue_types"],
+            "ari_scores": ari_scores,
+            "iou_scores": iou_scores,
+            "boundary_f1_scores": boundary_f1_scores,
+            "macro_f1_scores": macro_f1_scores,
+            "weighted_f1_scores": weighted_f1_scores,
         }
 
         return batch_metrics
@@ -797,7 +1099,8 @@ class CellViTTrainer(BaseTrainer):
             gt (DataclassHVStorage): Ground truth values
         Returns:
             dict: Dictionary with metrics. Keys:
-                binary_dice_scores, binary_jaccard_scores, tissue_pred, tissue_gt
+                binary_dice_scores, binary_jaccard_scores, pq_scores, cell_type_pq_scores, tissue_pred, tissue_gt,
+                ari_scores, iou_scores, boundary_f1_scores, macro_f1_scores, weighted_f1_scores
         """
         predictions = predictions.get_dict()
         gt = gt.get_dict()
@@ -835,6 +1138,11 @@ class CellViTTrainer(BaseTrainer):
         binary_jaccard_scores = []
         cell_type_pq_scores = []
         pq_scores = []
+        ari_scores = []
+        iou_scores = []
+        boundary_f1_scores = []
+        macro_f1_scores = []
+        weighted_f1_scores = []
 
         for i in range(len(pred_tissue)):
             # binary dice score: Score for cell detection per image, without background
@@ -847,7 +1155,7 @@ class CellViTTrainer(BaseTrainer):
             )
             binary_dice_scores.append(float(cell_dice))
 
-            # binary aji
+            # binary jaccard (IoU)
             cell_jaccard = (
                 binary_jaccard_index(
                     preds=pred_binary_map,
@@ -857,11 +1165,48 @@ class CellViTTrainer(BaseTrainer):
                 .cpu()
             )
             binary_jaccard_scores.append(float(cell_jaccard))
+            iou_scores.append(float(cell_jaccard))
+            
             # pq values
             remapped_instance_pred = remap_label(predictions["instance_map"][i])
             remapped_gt = remap_label(instance_maps_gt[i])
             [_, _, pq], _ = get_fast_pq(true=remapped_gt, pred=remapped_instance_pred)
             pq_scores.append(pq)
+            
+            # ARI (Adjusted Rand Index)
+            from sklearn.metrics import adjusted_rand_score
+            ari = adjusted_rand_score(
+                remapped_gt.flatten(),
+                remapped_instance_pred.flatten()
+            )
+            ari_scores.append(ari)
+            
+            # Boundary F1-Score
+            boundary_f1 = self.calculate_boundary_f1(
+                predictions["instance_map"][i],
+                instance_maps_gt[i]
+            )
+            boundary_f1_scores.append(boundary_f1)
+            
+            # Nuclei type classification metrics (Macro-F1 and Weighted-F1)
+            pred_nuclei_type = torch.argmax(predictions["nuclei_type_map"][i], dim=0).detach().cpu().numpy()
+            gt_nuclei_type = torch.argmax(gt["nuclei_type_map"][i], dim=0).detach().cpu().numpy()
+            
+            from sklearn.metrics import f1_score
+            macro_f1 = f1_score(
+                gt_nuclei_type.flatten(),
+                pred_nuclei_type.flatten(),
+                average='macro',
+                zero_division=0
+            )
+            weighted_f1 = f1_score(
+                gt_nuclei_type.flatten(),
+                pred_nuclei_type.flatten(),
+                average='weighted',
+                zero_division=0
+            )
+            macro_f1_scores.append(macro_f1)
+            weighted_f1_scores.append(weighted_f1)
 
             # pq values per class (skip background)
             nuclei_type_pq = []
@@ -893,6 +1238,11 @@ class CellViTTrainer(BaseTrainer):
             "cell_type_pq_scores": cell_type_pq_scores,
             "tissue_pred": pred_tissue,
             "tissue_gt": gt["tissue_types"],
+            "ari_scores": ari_scores,
+            "iou_scores": iou_scores,
+            "boundary_f1_scores": boundary_f1_scores,
+            "macro_f1_scores": macro_f1_scores,
+            "weighted_f1_scores": weighted_f1_scores,
         }
 
         return batch_metrics
@@ -933,13 +1283,11 @@ class CellViTTrainer(BaseTrainer):
         )
         predictions["instance_types_nuclei"] = predictions[
             "instance_types_nuclei"
-        ].transpose(0, 2, 3, 1)
+        ].permute(0, 2, 3, 1)
 
         gt["hv_map"] = gt["hv_map"].permute(0, 2, 3, 1)
         gt["nuclei_type_map"] = gt["nuclei_type_map"].permute(0, 2, 3, 1)
-        predictions["instance_types_nuclei"] = predictions[
-            "instance_types_nuclei"
-        ].transpose(0, 2, 3, 1)
+        gt["nuclei_binary_map"] = gt["nuclei_binary_map"].permute(0, 2, 3, 1)
 
         h = gt["hv_map"].shape[1]
         w = gt["hv_map"].shape[2]
@@ -973,7 +1321,10 @@ class CellViTTrainer(BaseTrainer):
 
         # get ground truth labels
         gt_sample_binary_map = (
-            gt["nuclei_binary_map"][sample_indices].detach().cpu().numpy()
+            torch.argmax(gt["nuclei_binary_map"][sample_indices], dim=-1)
+            .detach()
+            .cpu()
+            .numpy()
         )
         gt_sample_hv_map = gt["hv_map"][sample_indices].detach().cpu().numpy()
         gt_sample_instance_map = (

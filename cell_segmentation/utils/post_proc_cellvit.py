@@ -53,7 +53,7 @@ class DetectionCellPostProcessor:
         self.gt = gt
 
         if magnification == 40:
-            self.object_size = 10
+            self.object_size = 5 # 10 -> 5 to help recall of small cells (Dead, Connective)
             self.k_size = 21
         elif magnification == 20:
             self.object_size = 3  # 3 or 40, we used 5
@@ -179,7 +179,7 @@ class DetectionCellPostProcessor:
         blb = np.array(blb_raw >= 0.5, dtype=np.int32)
 
         blb = measurements.label(blb)[0]  # ndimage.label(blb)[0]
-        blb = remove_small_objects(blb, min_size=10)  # 10
+        blb = remove_small_objects(blb, min_size=5)  # 10 -> 5
         blb[blb > 0] = 1  # background is 0 already
 
         h_dir = cv2.normalize(

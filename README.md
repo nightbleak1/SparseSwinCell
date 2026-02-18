@@ -1,288 +1,172 @@
-# SparseSwinCell: Cell Segmentation with Sparse Swin Transformers
+# SparseSwinCell: High-Performance Cell Segmentation with Sparse Swin Transformers
 
-## 项目概述
+**SparseSwinCell** 是一个先进的病理图像分析系统，专为复杂的细胞核分割与分类任务设计。它基于 **Swin Transformer V2** 骨干网络，创新性地引入了 **稀疏注意力机制 (Sparse Attention)** 和 **多任务形状流 (Multi-task Shape Stream)**，在保持高效计算的同时，显著提升了对粘连细胞和微小细胞的检测精度。
 
-SparseSwinCell是一个基于Vision Transformer的细胞分割系统，以Swin Transformer V2为backbone，并融入了多种稀疏VIT机制。该系统能够准确分割组织切片图像中的细胞核，并识别其类型，支持多种数据集，包括PanNuke和MoNuSeg。
+本项目针对 **PanNuke** 和 **CoNSeP** 等高难度数据集进行了深度优化，集成了从数据预处理、增强、训练到全切片推理 (WSI Inference) 的完整工作流。
 
-项目包含完整的训练、评估和推理流程，支持从头训练、断点续训和超参数扫描，提供了多种模型变体以适应不同的应用场景。
+---
 
-## 技术栈
+## 🌟 核心创新 (Key Innovations)
 
-- **深度学习框架**: PyTorch
-- **计算机视觉库**: torchvision, OpenCV
-- **模型架构**: Swin Transformer V2, SparseSwinCell, 稀疏VIT
-- **数据集**: PanNuke, MoNuSeg
-- **损失函数**: BCEWithLogitsLoss, Focal Loss
-- **优化器**: AdamW
-- **学习率调度**: CosineAnnealingLR
-- **混合精度训练**: AMP
+1.  **稀疏 Swin Transformer (Sparse Attention)**
+    *   引入 **KM Attention** 机制，基于熵 (Entropy) 动态调整注意力保留比例 (Top-K)。
+    *   大幅降低 Transformer 的计算复杂度，同时保留关键的上下文依赖。
 
-## 模型架构
+2.  **双流架构与形状感知 (Shape Stream)**
+    *   除了主干网络，设计了独立的 **Shape Stream** 分支，专门提取细胞边缘特征。
+    *   通过 **Attention Gates** 将边缘信息注入解码器，显著改善了细胞边界的分割效果。
 
-### 核心模型
+3.  **四阶段渐进式训练策略 (4-Stage Progressive Training)**
+    *   独创的训练调度方案，从全局特征学习逐步过渡到边缘攻坚。
+    *   **动态边界损失**: 在训练后期根据验证集指标自动提升边界损失权重，强制模型关注困难样本。
 
-SparseSwinCell采用编码器-解码器架构，主要包含以下组件：
+4.  **全方位数据增强与归一化**
+    *   集成 **Reinhard 染色归一化** 和 **局部相位增强**，解决不同实验室制片的色差问题。
+    *   使用 **WeightedRandomSampler** 和 **动态损失加权** 彻底解决类别不平衡（如 Dead/Connective 细胞稀缺）问题。
 
-#### 1. Swin Transformer Backbone with km Attention
-- **Patch Embedding**: 将输入图像分割为4x4的补丁，线性投影到嵌入空间
-- **Swin Transformer Layers**: 4个阶段的分层设计，每个阶段包含多个Swin Transformer层
-- **km Attention**: 只保留top-k比例的注意力权重，减少计算复杂度
-- **Patch Merging**: 每个阶段结束时进行下采样，特征图尺寸减半，通道数翻倍
+---
 
-#### 2. 解码器结构
-- **瓶颈上采样**: 将编码器输出的最高级特征上采样
-- **多级融合**: 依次与编码器各阶段输出的特征进行融合
-- **反卷积块**: 使用Deconv2DBlock进行上采样和特征提取
-- **卷积块**: 使用Conv2DBlock进行特征融合和处理
+## 🏗 模型架构 (Model Architecture)
 
-#### 3. 多分支输出
-- **细胞核二进制映射**: 预测每个像素是否为细胞核（2通道）
-- **HV映射**: 预测每个细胞核像素的水平和垂直偏移（2通道），用于实例分割
-- **细胞核类型映射**: 预测每个细胞核的类型（6通道）
-- **组织类型预测**: 基于全局特征预测图像的组织类型（19通道）
-  - 增强型分类头架构，包含BatchNorm、GELU激活和dropout层
-  - 改进的特征处理，添加了dropout层提高泛化能力
-  - 更高的损失权重，确保模型充分关注组织分类任务
+SparseSwinCell 采用改进的 U-Net 编码器-解码器结构，包含以下关键组件：
 
-### 模型变体
+### 1. 编码器 (Encoder)
+*   **Backbone**: Swin Transformer V2 (Tiny/Small/Base)。
+*   **Sparse Mechanism**:
+    *   **Dynamic K**: 根据注意力图的熵值自动计算最优 K 值。
+    *   **Head Pruning**: 可学习的注意力头权重，自动抑制冗余的 Head。
 
-项目包含多个模型变体，位于`models/segmentation/cell_segmentation/`目录：
-- **cellvit.py**: 基础SparseSwinCell模型，基于Swin Transformer with km Attention
-- **sparse_cellvit.py**: 增强型稀疏CellViT模型，包含更多稀疏机制
-- **sparse_utils.py**: 稀疏VIT相关工具函数
-- **utils.py**: 通用工具函数
+### 2. 颈部 (Neck)
+*   **ASPP**: 空洞空间金字塔池化 (Dilations: 1, 6, 12, 18)，捕获多尺度上下文。
+*   **Shape Stream**: 并行卷积分支，专注于生成高频边缘特征 (`edge_map`)。
 
-### 稀疏VIT机制
+### 3. 解码器 (Decoder) - 多任务输出
+采用多分支结构，通过 **Attention Gates** 融合编码器特征：
+*   **Nuclei Binary Branch**: 预测细胞核前景/背景 (Focal Tversky Loss)。
+*   **HV Map Branch**: 预测水平/垂直距离图，用于分离粘连细胞 (MSE + MSGE Loss)。
+    *   融合了 Shape Stream 的特征以增强边界。
+*   **Nuclei Type Branch**: 预测 6 类细胞核类型 (Neoplastic, Inflammatory, etc.)。
+*   **Tissue Type Branch**: 基于全局特征 (GAP) 预测 19 类组织来源。
 
-项目实现了多种稀疏VIT机制，用于优化模型性能和效率：
-- **分层稀疏性**: 在不同阶段采用不同的稀疏策略
-- **基于内容的稀疏性**: 根据特征内容动态调整注意力权重
-- **动态km attention**: 根据输入内容动态调整top-k比例
-- **全局稀疏性**: 跨层的稀疏策略协调
+---
 
-## 数据处理
+## 🚀 训练策略 (Training Strategy)
 
-### 数据集划分
+这是本项目取得高性能的关键。我们采用精细的 **"先粗后细，重点攻坚"** 策略。
 
-- **PanNuke**: 
-  - 训练集: fold0, fold1
-  - 测试集: fold2
-- **MoNuSeg**: 用于验证（训练时不使用，仅在训练结束后用于最终模型评估）
+### 1. 损失函数体系
+总损失为各任务加权和：
+*   **分割**: Focal Tversky Loss (1.0) + Dice Loss (1.0)
+*   **回归 (HV Map)**: MSE Loss (1.0) + **MSGE Loss (Gradient Consistency)** (1.0)
+*   **分类**: Cross Entropy + Dice + Focal Loss
+*   **边界**: **Dynamic Boundary Loss** (初始 0.5 -> 最高 1.7)
 
-### 染色归一化
+### 2. 优化器与调度
+*   **Optimizer**: AdamW (LR=1e-4, Weight Decay=1e-5).
+*   **Scheduler**:
+    *   **Epoch 0-90**: Cosine Annealing (1e-4 -> 1e-6).
+    *   **Epoch 90 (Hard Restart)**: 强制重置 LR 为 **2e-5**，跳出局部最优。
+    *   **Epoch 90-120**: Linear Decay (2e-5 -> 5e-6)，进行最后微调。
 
-为了处理不同组织切片之间的染色差异，项目实现了基于风格一致性的染色归一化方法：
-- **局部相位增强**: 增强图像的相位信息，突出细胞核结构
-- **风格一致性熵模型**: 确保不同图像之间的染色风格一致
-- **CDF归一化**: 对每个颜色通道进行累积分布函数归一化
-- **Lab颜色空间处理**: 在Lab空间中进行相位处理，然后转换回RGB
+### 3. 四阶段权重调整 (Four-Stage Weight Adjustment)
+| 阶段 | Epoch | 策略描述 | 关键调整 |
+| :--- | :--- | :--- | :--- |
+| **I** | 0-50 | **基础学习** | 各任务权重平衡，学习通用特征。 |
+| **II** | 50-60 | **核心强化** | 稳步强化核心损失，温和弱化非核心损失。 |
+| **III** | 60-90 | **动态适配** | 维持分类权重，防止 mPQ 崩溃；引入动态边界监控。 |
+| **IV** | 90+ | **边界攻坚** | **边界损失权重 -> 1.5+** (若 F1 无提升则 +0.1) <br> **边缘流权重 -> 2.0** <br> **分类权重 -> 2.0** |
 
-### 数据增强
+---
 
-支持多种数据增强操作：
-- 随机翻转
-- 随机旋转
-- 随机缩放
-- 颜色扰动
+## 🛠 安装与使用 (Installation & Usage)
 
-## 训练流程
-
-### 训练配置
-
-- **损失函数**: 
-  - BCEWithLogitsLoss（用于二进制分割任务）
-  - CrossEntropyLoss（用于细胞核类型和组织类型分类）
-    - 组织分类损失权重: 2.0（提高模型对组织分类的关注度）
-- **优化器**: AdamW，初始学习率1e-4
-- **学习率调度**: CosineAnnealingLR
-- **批量大小**: 32（可根据GPU内存调整）
-- **混合精度训练**: FP16
-- **早期停止**: 监控验证指标，当性能不再提升时停止训练
-- **CUDA优化**: 
-  - 启用cuDNN自动调优
-  - 增加workers数量，加速数据加载
-  - 启用persistent_workers和prefetch_factor，优化数据预取
-
-### 从头训练
-
-使用`train_from_scratch.py`脚本进行从头训练：
-
+### 环境准备
 ```bash
-cd /hy-tmp/SparseSwinCell && python cell_segmentation/trainer/train_from_scratch.py
-```
-
-### 断点续训
-
-支持从检查点恢复训练，自动保存最佳模型、最新模型和定期检查点。
-
-## 项目结构
-
-```
-SparseSwinCell/
-├── base_ml/                   # 基础机器学习组件
-│   └── base_trainer.py        # 基础训练器
-├── cell_segmentation/         # 细胞分割主模块
-│   ├── data_preparation.py    # 数据准备脚本
-│   ├── datasets/              # 数据集处理
-│   │   ├── base_cell.py       # 基础细胞数据集类
-│   │   ├── pannuke.py         # PanNuke数据集处理
-│   │   ├── monuseg.py         # MoNuSeg数据集处理
-│   │   └── prepare_*.py       # 数据集预处理脚本
-│   ├── evaluate.py            # 评估脚本
-│   ├── experiments/           # 实验配置和结果
-│   ├── inference/             # 推理相关代码
-│   ├── inference.py           # 推理脚本
-│   ├── models/                # 模型定义
-│   │   └── backbone/          # 骨干网络
-│   │       └── swin_transformer.py  # Swin Transformer定义
-│   ├── pretrain_mae.py        # MAE预训练脚本
-│   ├── run_sparse_cellvit.py  # 稀疏CellViT运行脚本
-│   ├── trainer/               # 训练脚本
-│   │   ├── trainer_cellvit.py # SparseSwinCell训练器
-│   │   └── train_from_scratch.py  # 从头训练脚本
-│   └── utils/                 # 工具函数
-├── checkpoints/               # 模型检查点
-├── configs/                   # 配置文件
-├── datamodel/                 # 数据模型定义
-├── docs/                      # 文档
-├── example/                   # 示例代码
-├── environment.yml            # Conda环境配置
-├── experiment_logs/           # 实验日志
-├── logs/                      # 训练日志
-├── logs_paper/                # 论文相关日志
-├── makefile                   # 构建脚本
-├── models/                    # 模型库
-│   └── segmentation/          # 分割模型
-│       └── cell_segmentation/ # 细胞分割模型
-│           ├── cellvit.py     # SparseSwinCell核心模型
-│           ├── sparse_cellvit.py # 稀疏CellViT模型
-│           ├── sparse_utils.py # 稀疏VIT相关工具函数
-│           └── utils.py       # 通用工具
-├── optional_dependencies.txt  # 可选依赖
-├── preprocessing/             # 预处理脚本
-├── reports/                   # 报告
-├── requirements.txt           # 必要依赖
-├── utils/                     # 通用工具函数
-├── .flake8                    # Flake8配置
-├── .gitignore                 # Git忽略文件
-├── .pre-commit-config.yaml    # 预提交钩子配置
-├── LICENSE                    # 许可证
-└── README.md                  # 项目说明文档
-```
-
-## 如何使用
-
-### 创建虚拟环境
-
-推荐使用conda创建虚拟环境，以确保依赖包的版本兼容性：
-
-```bash
-# 创建虚拟环境
 conda create -n sparseswincell python=3.11
-
-# 激活虚拟环境
 conda activate sparseswincell
-
-# 安装PyTorch和torchvision（根据CUDA版本调整）
-conda install pytorch torchvision torchaudio pytorch-cuda=12.1 -c pytorch -c nvidia
-```
-
-### 安装依赖
-
-在激活虚拟环境后，安装项目所需的其他依赖：
-
-```bash
+conda install pytorch torchvision pytorch-cuda=12.1 -c pytorch -c nvidia
 pip install -r requirements.txt
 ```
 
 ### 数据准备
-
-1. 下载PanNuke和MoNuSeg数据集
-2. 运行预处理脚本：
-   ```bash
-   cd SparseSwinCell && python cell_segmentation/datasets/prepare_pannuke.py
-   cd SparseSwinCell && python cell_segmentation/datasets/prepare_monuseg.py
-   ```
-
-### 训练模型
-
-#### 使用train_from_scratch.py进行从头训练
-
 ```bash
-cd SparseSwinCell && python cell_segmentation/trainer/train_from_scratch.py
+# 预处理 PanNuke 数据集 (生成 HV Maps, 归一化等)
+python cell_segmentation/datasets/prepare_pannuke.py
 ```
 
-#### 使用run_sparse_cellvit.py运行完整实验
-
+### 训练 (Training)
 ```bash
-cd SparseSwinCell
+# 从头开始训练 (推荐)
+python cell_segmentation/trainer/train_from_scratch.py
 
-# 使用默认配置运行稀疏CellViT实验
-python cell_segmentation/run_sparse_cellvit.py
-
-# 从检查点恢复实验
-python cell_segmentation/run_sparse_cellvit.py --checkpoint <path_to_checkpoint>
-
-# 运行超参数扫描
-python cell_segmentation/run_sparse_cellvit.py --run_sweep
+# 从断点恢复
+python cell_segmentation/trainer/train_from_scratch.py --resume --checkpoint logs/latest_checkpoint.pth
 ```
 
-### 评估模型
-
-训练结束后，模型将自动在测试集上进行评估。可以使用以下命令手动评估：
-
+### 评估 (Evaluation)
 ```bash
-cd SparseSwinCell
+# 评估 PanNuke 数据集 (自动读取 config)
+python cell_segmentation/inference/inference_cellvit_experiment_pannuke.py \
+    --run_dir logs/train_cellvit_timestamp \
+    --gpu 0
 
-# 使用专门的评估脚本
-python cell_segmentation/evaluate.py --checkpoint <path_to_checkpoint>
+# 评估 CoNSeP 数据集
+python cell_segmentation/inference/inference_cellvit_experiment_consep.py \
+    --run_dir logs/train_cellvit_timestamp \
+    --checkpoint_name final_model.pth \
+    --gpu 0 \
+    --magnification 40 \
+    --plots
 ```
 
-### 推理
-
-使用训练好的模型进行推理：
-
+### 全切片推理 (WSI Inference)
+支持多进程处理巨大的病理切片 (.svs, .tiff 等)：
 ```bash
-cd SparseSwinCell && python cell_segmentation/inference.py --checkpoint <path_to_checkpoint> --image <path_to_image>
+# 处理整个 WSI 数据集
+python cell_segmentation/inference/cell_detection_mp.py process_dataset \
+    --model checkpoints/model_best.pth \
+    --wsi_paths /path/to/wsi_folder \
+    --output_path /path/to/output \
+    --n_postprocess_workers 8
 ```
 
-## 改进点
+---
 
-1. **采用Swin Transformer V2**: 使用Swin Transformer V2作为backbone，替代传统ViT
-2. **稀疏VIT机制**: 加入多种稀疏注意力机制，提高模型效率
-3. **染色归一化**: 实现基于风格一致性的染色归一化，处理染色差异问题
-4. **删除RGB转换**: 直接使用原始RGB格式，避免不必要的转换
-5. **增强组织分类**: 
-   - 改进组织分类头架构，添加BatchNorm、GELU激活和dropout层
-   - 增强特征处理，添加dropout层提高泛化能力
-6. **CUDA优化**: 
-    - 启用cuDNN自动调优，加速卷积运算
-    - 增加workers数量，提高数据加载速度
-    - 启用persistent_workers和prefetch_factor，优化数据预取
-    - 可根据GPU内存调整批量大小
+## 📊 性能指标 (Metrics)
 
-## 评估指标
+模型在测试时会自动计算以下指标：
+*   **Instance Segmentation**: Panoptic Quality (PQ), bPQ (Binary), mPQ (Multi-class).
+*   **Detection**: F1-Score, Precision, Recall.
+*   **Semantic Segmentation**: Dice, Jaccard (IoU).
+*   **Boundary Quality**: Boundary F1-Score.
 
-模型使用以下指标进行评估：
+---
 
-- **细胞核分割**: IoU, F1分数
-- **细胞核类型分类**: 准确率, F1分数
-- **实例分割**: PQ (Panoptic Quality), AP (Average Precision)
-- **组织类型分类**: 准确率, F1分数
+## 📂 项目结构
 
-## 许可证
+```text
+SparseSwinCell/
+├── base_ml/                   # 基础训练框架
+├── cell_segmentation/
+│   ├── datasets/              # 数据集加载与预处理 (PanNuke, CoNSeP)
+│   ├── inference/             # 推理脚本 (WSI, Experiment Evaluation)
+│   ├── models/                # 模型定义
+│   │   ├── backbone/          # Swin Transformer V2
+│   │   ├── cellvit.py         # 基础模型结构
+│   │   └── sparse_cellvit.py  # 稀疏化与多任务实现
+│   ├── trainer/               # 训练逻辑 (Trainer, Loss, Scheduler)
+│   └── utils/                 # 指标计算与后处理
+├── configs/                   # 实验配置文件
+└── logs/                      # 训练日志与模型权重
+```
 
-本项目采用MIT许可证。
+## 📝 许可证与引用
 
-## 参考文献
+本项目采用 MIT 许可证。
+参考论文：
+1. Swin Transformer V2 (arXiv:2111.09883)
+2. HoVer-Net (arXiv:1812.06499)
+3. CellViT (arXiv:2306.15350)
 
-1. Swin Transformer: https://arxiv.org/abs/2103.14030
-2. Swin Transformer V2: https://arxiv.org/abs/2111.09883
-3. PanNuke Dataset: https://arxiv.org/abs/2003.10778
-4. MoNuSeg Dataset: https://arxiv.org/abs/1806.05587
-
-## 联系方式
-
-如有问题或建议，请通过以下方式联系：
-
-- 邮箱: [1776535661@qq.com]
+---
+如有问题，请联系: [1776535661@qq.com]
