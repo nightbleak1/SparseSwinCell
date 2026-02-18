@@ -67,7 +67,9 @@ class CoNSePDataset(Dataset):
                 * str: filename
         """
         img_path = self.images[index]
-        img = np.array(Image.open(img_path)).astype(np.uint8)
+        # Load as RGB then convert to BGR to match PanNuke training
+        img = np.array(Image.open(img_path).convert("RGB"))
+        img = img[:, :, ::-1].copy().astype(np.uint8)
 
         mask_path = self.masks[index]
         mask = np.load(mask_path, allow_pickle=True)

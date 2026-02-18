@@ -654,11 +654,11 @@ class InferenceCellViT:
     ) -> DataclassHVStorage:
         # get ground truth values, perform one hot encoding for segmentation maps
         gt_nuclei_binary_map_onehot = (
-            F.one_hot(masks["nuclei_binary_map"], num_classes=2)
+            F.one_hot(masks["nuclei_binary_map"].long(), num_classes=2)
         ).type(
             torch.float32
         )  # background, nuclei
-        nuclei_type_maps = torch.squeeze(masks["nuclei_type_map"]).type(torch.int64)
+        nuclei_type_maps = masks["nuclei_type_map"].type(torch.int64)
         gt_nuclei_type_maps_onehot = F.one_hot(
             nuclei_type_maps, num_classes=self.num_classes
         ).type(

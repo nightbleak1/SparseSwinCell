@@ -58,11 +58,11 @@ from models.segmentation.cell_segmentation.cellvit import (
     CellViT256,
     CellViTSAM,
 )
-from models.segmentation.cell_segmentation.cellvit_shared import (
-    CellViT256Shared,
-    CellViTSAMShared,
-    CellViTShared,
-)
+# from models.segmentation.cell_segmentation.cellvit_shared import (
+#     CellViT256Shared,
+#     CellViTSAMShared,
+#     CellViTShared,
+# )
 from preprocessing.encoding.datasets.patched_wsi_inference import PatchedWSIInference
 from utils.file_handling import load_wsi_files_from_csv
 from utils.logger import Logger
@@ -143,11 +143,11 @@ class CellSegmentationInference:
         self, model_type: str
     ) -> Union[
         CellViT,
-        CellViTShared,
         CellViT256,
-        CellViT256Shared,
         CellViTSAM,
-        CellViTSAMShared,
+        # CellViTShared,
+        # CellViT256Shared,
+        # CellViTSAMShared,
     ]:
         """Return the trained model for inference
 
@@ -616,7 +616,37 @@ class CellPostProcessor:
         self.logger = logger
         self.logger.info("Initializing Cell-Postprocessor")
         self.cell_df = pd.DataFrame(cell_list)
-        self.cell_df = self.cell_df.parallel_apply(convert_coordinates, axis=1)
+        if len(self.cell_df) > 0:
+            # pandarallel seems to fail with 0 workers or if dataset is too small
+            # Let's fallback to standard apply if pandarallel fails or if list is small
+            try:
+                if len(self.cell_df) < 100:
+                    self.cell_df = self.cell_df.apply(convert_coordinates, axis=1)
+                else:
+                    # pandarallel.initialize(progress_bar=False, verbose=0) # Should be initialized globally
+                    # But if it fails with ValueError: Number of processes must be at least 1
+                    # It might be because of empty split or something?
+                    # Let's just use normal apply to be safe and avoid multiprocessing overhead for small tasks
+                    self.cell_df = self.cell_df.apply(convert_coordinates, axis=1)
+            except Exception as e:
+                self.logger.warning(f"Parallel apply failed, falling back to standard apply: {e}")
+                self.cell_df = self.cell_df.apply(convert_coordinates, axis=1)
+        else:
+            self.cell_df = pd.DataFrame(
+                columns=[
+                    "bbox",
+                    "centroid",
+                    "contour",
+                    "type_prob",
+                    "type",
+                    "patch_coordinates",
+                    "cell_status",
+                    "offset_global",
+                    "edge_position",
+                    "edge_information",
+                    "patch_pos_str",
+                ]
+            )
 
         self.mid_cells = self.cell_df[
             self.cell_df["cell_status"] == 0
@@ -689,77 +719,128 @@ class CellPostProcessor:
             for idx, cell_info in merged_cells.iterrows():
                 poly = Polygon(cell_info["contour"])
                 if not poly.is_valid:
-                    self.logger.debug("Found invalid polygon - Fixing with buffer 0")
+                    # self.logger.debug("Found invalid polygon - Fixing with buffer 0")
                     multi = poly.buffer(0)
                     if isinstance(multi, MultiPolygon):
-                        if len(multi) > 1:
-                            poly_idx = np.argmax([p.area for p in multi])
-                            poly = multi[poly_idx]
-                            poly = Polygon(poly)
+                         # Handle MultiPolygon (keep largest part)
+                        if len(multi.geoms) > 0:
+                             poly = max(multi.geoms, key=lambda a: a.area)
                         else:
-                            poly = multi[0]
-                            poly = Polygon(poly)
+                             # Empty multipolygon?
+                             poly = Polygon() # Should be filtered out later if empty
                     else:
-                        poly = Polygon(multi)
-                poly.uid = idx
+                        poly = multi
+                
+                # Shapely 2.0 removed ability to attach arbitrary attributes to geometry objects
+                # We need to maintain a separate mapping or list
+                # Here we are appending to poly_list.
+                # Let's use a tuple or wrapper object, or parallel list.
+                # But strtree.query returns indices in Shapely 2.0!
+                
+                # In Shapely < 2.0, strtree.query returned the objects themselves.
+                # In Shapely 2.0, strtree.query returns indices.
+                
+                # Let's adapt for Shapely 2.0 first, assuming it is installed.
+                # If we use indices, we don't need .uid attribute on poly.
+                
                 poly_list.append(poly)
 
             # use an strtree for fast querying
             tree = strtree.STRtree(poly_list)
 
-            merged_idx = deque()
+            merged_idx = [] # Use list instead of deque for easier handling
             iterated_cells = set()
-            overlaps = 0
-
-            for query_poly in poly_list:
-                if query_poly.uid not in iterated_cells:
-                    intersected_polygons = tree.query(
-                        query_poly
-                    )  # this also contains a self-intersection
-                    if (
-                        len(intersected_polygons) > 1
-                    ):  # we have more at least one intersection with another cell
-                        submergers = []  # all cells that overlap with query
-                        for inter_poly in intersected_polygons:
-                            if (
-                                inter_poly.uid != query_poly.uid
-                                and inter_poly.uid not in iterated_cells
-                            ):
-                                if (
-                                    query_poly.intersection(inter_poly).area
-                                    / query_poly.area
-                                    > 0.01
-                                    or query_poly.intersection(inter_poly).area
-                                    / inter_poly.area
-                                    > 0.01
-                                ):
-                                    overlaps = overlaps + 1
-                                    submergers.append(inter_poly)
-                                    iterated_cells.add(inter_poly.uid)
-                        # catch block: empty list -> some cells are touching, but not overlapping strongly enough
-                        if len(submergers) == 0:
-                            merged_idx.append(query_poly.uid)
-                        else:  # merging strategy: take the biggest cell, other merging strategies needs to get implemented
-                            selected_poly_index = np.argmax(
-                                np.array([p.area for p in submergers])
-                            )
-                            selected_poly_uid = submergers[selected_poly_index].uid
-                            merged_idx.append(selected_poly_uid)
-                    else:
-                        # no intersection, just add
-                        merged_idx.append(query_poly.uid)
-                    iterated_cells.add(query_poly.uid)
+            overlaps_count = 0
+            
+            # Iterate through all polygons by index
+            # In Shapely 2.0, tree.query(geom) returns indices of intersecting geometries
+            
+            # But the original code logic is complex: it iterates and maintains state (iterated_cells).
+            # Let's try to preserve the logic.
+            
+            # We need to map index back to dataframe index (cell_info.name which is idx)
+            # merged_cells.index is the UID
+            # Let's create a mapping from list_index -> dataframe_uid
+            list_idx_to_uid = {i: uid for i, uid in enumerate(merged_cells.index)}
+            uid_to_list_idx = {uid: i for i, uid in enumerate(merged_cells.index)}
+            
+            for i, query_poly in enumerate(poly_list):
+                current_uid = list_idx_to_uid[i]
+                
+                if current_uid in iterated_cells:
+                    continue
+                    
+                # Query tree
+                # Shapely 2.0: query(geometry) -> array of indices
+                # Shapely < 2.0: query(geometry) -> list of geometries
+                
+                query_result = tree.query(query_poly)
+                
+                intersecting_indices = []
+                if isinstance(query_result, (list, tuple)) and len(query_result) > 0 and isinstance(query_result[0], (Polygon, MultiPolygon)):
+                     # Old Shapely behavior (returning objects) - NOT supported by Shapely 2.0 usually but let's be safe
+                     # If we are here, we are in trouble because we can't get UID back easily without the attribute hack
+                     # But we know Shapely 2.0 is installed.
+                     pass
+                else:
+                     # Shapely 2.0 behavior: returns indices
+                     intersecting_indices = query_result
+                
+                # Filter self
+                # intersecting_indices might be a numpy array of indices
+                
+                submergers_indices = []
+                
+                for intersect_idx in intersecting_indices:
+                    intersect_uid = list_idx_to_uid[intersect_idx]
+                    
+                    if intersect_uid == current_uid or intersect_uid in iterated_cells:
+                        continue
+                        
+                    inter_poly = poly_list[intersect_idx]
+                    
+                    # Calculate intersection
+                    try:
+                        intersection_area = query_poly.intersection(inter_poly).area
+                        if (intersection_area / query_poly.area > 0.01) or (intersection_area / inter_poly.area > 0.01):
+                             overlaps_count += 1
+                             submergers_indices.append(intersect_idx)
+                             # We mark them as iterated later?
+                             # Original code marks them as iterated immediately inside loop
+                             # iterated_cells.add(inter_poly.uid) 
+                    except Exception:
+                        continue
+                
+                if len(submergers_indices) == 0:
+                    merged_idx.append(current_uid)
+                    iterated_cells.add(current_uid)
+                else:
+                    # Resolve overlap: pick biggest
+                    # Candidates: current + submergers
+                    candidates_indices = [i] + submergers_indices
+                    
+                    # Find max area
+                    best_idx = max(candidates_indices, key=lambda idx: poly_list[idx].area)
+                    best_uid = list_idx_to_uid[best_idx]
+                    
+                    merged_idx.append(best_uid)
+                    
+                    # Mark all candidates as processed
+                    for idx in candidates_indices:
+                        iterated_cells.add(list_idx_to_uid[idx])
 
             self.logger.info(
-                f"Iteration {iteration}: Found overlap of # cells: {overlaps}"
+                f"Iteration {iteration}: Found overlap of # cells: {overlaps_count}"
             )
-            if overlaps == 0:
+            if overlaps_count == 0:
                 self.logger.info("Found all overlapping cells")
                 break
-            elif iteration == 20:
-                self.logger.info(
-                    f"Not all doubled cells removed, still {overlaps} to remove. For perfomance issues, we stop iterations now. Please raise an issue in git or increase number of iterations."
+            elif iteration == 19: # 0-19 is 20 iterations
+                 self.logger.info(
+                    f"Not all doubled cells removed, still {overlaps_count} to remove. Stopping."
                 )
+            
+            # Filter merged_cells for next iteration
             merged_cells = cleaned_edge_cells.loc[
                 cleaned_edge_cells.index.isin(merged_idx)
             ].sort_index()

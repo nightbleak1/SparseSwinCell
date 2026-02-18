@@ -488,6 +488,40 @@ def train(resume_from_checkpoint=False, checkpoint_path=None):
         current_tissue_weight = initial_tissue_weight
         current_edge_weight = initial_edge_weight
         
+        # ---------------------------------------------------------------------
+        # Dynamic Class Weight Adjustment for Epoch > 50 (User Requirement)
+        # ---------------------------------------------------------------------
+        if current_epoch > 50:
+             # Re-calculate Nuclei Weights: 
+             # 1. Quantity-based (Inverse Frequency)
+             # 2. No manual overrides (e.g. Connective)
+             # 3. Dead cell weight = 2.0
+             
+             new_nuclei_weights = [0.5] # Background fixed at 0.5
+             for i in range(1, 6):
+                 count = nuclei_counts_dict[i]
+                 # Standard Inverse Frequency
+                 w = total_nuclei_samples / (num_nuclei_foreground * count)
+                 
+                 if i == 4: # Dead
+                     w = 2.0 # Explicitly set to 2.0
+                 else:
+                     # Clamp others to avoid extreme values (standard practice)
+                     w = min(max(w, 0.5), 5.0) 
+                 
+                 new_nuclei_weights.append(w)
+             
+             new_nuclei_weights_tensor = torch.Tensor(new_nuclei_weights).to(device)
+             
+             # Update Nuclei Loss Class Weights in Trainer
+             # Note: trainer.loss_fn_dict structure: {loss_name: {sub_loss: (loss_fn, weight)}}
+             loss_fn = trainer.loss_fn_dict["nuclei_type_map"]["focal_tversky"][0]
+             loss_fn.class_weights = new_nuclei_weights_tensor
+             
+             # Log once per phase start or resume
+             if current_epoch == 51 or current_epoch == start_epoch + 1:
+                 logger.info(f"Epoch > 50: Updated Nuclei Class Weights (Dead=2.0, others quantity-based). New Weights: {new_nuclei_weights}")
+
         # 第三阶段：50轮到90轮（在强化边界的同时，维持足够的分类权重以避免 mPQ 崩溃）
         if 50 < current_epoch <= 90:
             current_boundary_weight = 1.0
