@@ -91,6 +91,9 @@ class InferenceCellViT:
 
         self.logger.info(f"Loaded run: {run_dir}")
         self.num_classes = self.run_conf["data"]["num_nuclei_classes"]
+        
+        self.global_invalid_samples = 0
+        self.global_valid_samples = 0
 
     def __load_run_conf(self) -> None:
         """Load the config.yaml file with the run setup
@@ -191,11 +194,14 @@ class InferenceCellViT:
         checkpoint = torch.load(
             self.run_dir / "checkpoints" / self.checkpoint_name, map_location="cpu", weights_only=False
         )
-        model = self.get_model(model_type=checkpoint.get("arch", "SparseCellViT"))
+        model = self.get_model(model_type="SparseCellViT")
         self.logger.info(
             f"Loading best model from {str(self.run_dir / 'checkpoints' / self.checkpoint_name)}"
         )
-        self.logger.info(model.load_state_dict(checkpoint["model_state_dict"]))
+        if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
+            self.logger.info(model.load_state_dict(checkpoint["model_state_dict"], strict=False))
+        else:
+            self.logger.info(model.load_state_dict(checkpoint, strict=False))
 
         # get dataset
         if test_folds is None:
@@ -547,6 +553,13 @@ class InferenceCellViT:
             "nuclei_metrics_d": nuclei_metrics_d,
         }
 
+        # 输出样本统计信息
+        total_samples = self.global_valid_samples + self.global_invalid_samples
+        self.logger.info(f"{20*'*'} 样本统计 {20*'*'}")
+        self.logger.info(f"Total_Samples: {total_samples}")
+        self.logger.info(f"Valid_Samples: {self.global_valid_samples}")
+        self.logger.info(f"Invalid_Samples: {self.global_invalid_samples}")
+        
         # saving
         with open(str(self.run_dir / "inference_results.json"), "w") as outfile:
             json.dump(all_metrics, outfile, indent=2)
@@ -586,8 +599,7 @@ class InferenceCellViT:
         gt = self.unpack_masks(masks=masks, tissue_types=tissue_types, model=model)
 
         # scores
-        batch_metrics, scores = self.calculate_step_metric(predictions, gt, image_names)
-        batch_metrics["tissue_types"] = tissue_types
+        batch_metrics, scores = self.calculate_step_metric(predictions, gt, image_names, tissue_types)
         if generate_plots:
             self.plot_results(
                 imgs=imgs,
@@ -706,6 +718,7 @@ class InferenceCellViT:
         predictions: DataclassHVStorage,
         gt: DataclassHVStorage,
         image_names: list[str],
+        tissue_types: list,
     ) -> Tuple[dict, list]:
         """Calculate the metrics for the validation step
 
@@ -746,6 +759,12 @@ class InferenceCellViT:
             gt["instance_types_nuclei"].detach().cpu().numpy().astype("int32")
         )
 
+        # 有效样本跟踪
+        valid_image_names = []
+        valid_tissue_types = []
+        valid_pred_tissue = []
+        valid_gt_tissue_types = []
+        
         # segmentation scores
         binary_dice_scores = []  # binary dice scores per image
         binary_jaccard_scores = []  # binary jaccard scores per image
@@ -771,11 +790,31 @@ class InferenceCellViT:
         # for detections scores
         true_idx_offset = 0
         pred_idx_offset = 0
+        valid_sample_count = 0
 
         for i in range(len(pred_tissue)):
             # binary dice score: Score for cell detection per image, without background
             pred_binary_map = torch.argmax(predictions["nuclei_binary_map"][i], dim=0)
             target_binary_map = gt["nuclei_binary_map"][i]
+            
+            # 检查是否为无效样本（全0或含NaN）
+            is_invalid = False
+            if torch.all(target_binary_map == 0):
+                is_invalid = True
+                self.global_invalid_samples += 1
+            elif torch.any(torch.isnan(pred_binary_map)) or torch.any(torch.isnan(target_binary_map)):
+                is_invalid = True
+                self.global_invalid_samples += 1
+            if is_invalid:
+                continue
+            self.global_valid_samples += 1
+            
+            # 记录有效样本
+            valid_image_names.append(image_names[i])
+            valid_tissue_types.append(tissue_types[i])
+            valid_pred_tissue.append(pred_tissue[i])
+            valid_gt_tissue_types.append(gt["tissue_types"][i])
+            
             cell_dice = (
                 dice(preds=pred_binary_map, target=target_binary_map, ignore_index=0, task="binary")
                 .detach()
@@ -871,13 +910,14 @@ class InferenceCellViT:
                 true_centroids, pred_centroids, pairing_radius
             )
             true_idx_offset = (
-                true_idx_offset + true_inst_type_all[-1].shape[0] if i != 0 else 0
+                true_idx_offset + true_inst_type_all[-1].shape[0] if valid_sample_count != 0 else 0
             )
             pred_idx_offset = (
-                pred_idx_offset + pred_inst_type_all[-1].shape[0] if i != 0 else 0
+                pred_idx_offset + pred_inst_type_all[-1].shape[0] if valid_sample_count != 0 else 0
             )
             true_inst_type_all.append(true_instance_type)
             pred_inst_type_all.append(pred_instance_type)
+            valid_sample_count += 1
 
             # increment the pairing index statistic
             if paired.shape[0] != 0:  # ! sanity
@@ -894,14 +934,14 @@ class InferenceCellViT:
             cell_type_dq_scores.append(nuclei_type_dq)
             cell_type_sq_scores.append(nuclei_type_sq)
 
-        paired_all = np.concatenate(paired_all, axis=0)
-        unpaired_true_all = np.concatenate(unpaired_true_all, axis=0)
-        unpaired_pred_all = np.concatenate(unpaired_pred_all, axis=0)
-        true_inst_type_all = np.concatenate(true_inst_type_all, axis=0)
-        pred_inst_type_all = np.concatenate(pred_inst_type_all, axis=0)
+        paired_all = np.concatenate(paired_all, axis=0) if len(paired_all) > 0 else np.array([]).reshape(0, 2)
+        unpaired_true_all = np.concatenate(unpaired_true_all, axis=0) if len(unpaired_true_all) > 0 else np.array([])
+        unpaired_pred_all = np.concatenate(unpaired_pred_all, axis=0) if len(unpaired_pred_all) > 0 else np.array([])
+        true_inst_type_all = np.concatenate(true_inst_type_all, axis=0) if len(true_inst_type_all) > 0 else np.array([])
+        pred_inst_type_all = np.concatenate(pred_inst_type_all, axis=0) if len(pred_inst_type_all) > 0 else np.array([])
 
         batch_metrics = {
-            "image_names": image_names,
+            "image_names": valid_image_names,
             "binary_dice_scores": binary_dice_scores,
             "binary_jaccard_scores": binary_jaccard_scores,
             "pq_scores": pq_scores,
@@ -910,8 +950,9 @@ class InferenceCellViT:
             "cell_type_pq_scores": cell_type_pq_scores,
             "cell_type_dq_scores": cell_type_dq_scores,
             "cell_type_sq_scores": cell_type_sq_scores,
-            "tissue_pred": pred_tissue,
-            "tissue_gt": gt["tissue_types"],
+            "tissue_types": valid_tissue_types,
+            "tissue_pred": np.array(valid_pred_tissue),
+            "tissue_gt": np.array(valid_gt_tissue_types),
             "paired_all": paired_all,
             "unpaired_true_all": unpaired_true_all,
             "unpaired_pred_all": unpaired_pred_all,
