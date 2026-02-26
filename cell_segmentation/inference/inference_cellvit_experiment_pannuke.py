@@ -827,6 +827,7 @@ class InferenceCellViT:
                 binary_jaccard_index(
                     preds=pred_binary_map,
                     target=target_binary_map,
+                    ignore_index=0,
                 )
                 .detach()
                 .cpu()
